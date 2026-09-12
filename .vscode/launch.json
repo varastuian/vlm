@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Change Detect: run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--before", "Dataset/train/A/train_1.png",
+                "--after", "Dataset/train/B/train_1.png",
+                "--out", "change_output",
+                "--min-area", "150",
+                "--model", "qwen3-vl:4b",
+                "--ollama-url", "http://localhost:11434"
+            ]
+        }
+    ]
+}
