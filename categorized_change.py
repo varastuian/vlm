@@ -40,6 +40,15 @@ import json
 import os
 import sys
 
+# BIT_CD was trained on 256x256 tiles. A STAC crop smaller than that gets
+# padded up by border-replication in bit_cd_infer.predict_change_mask, which
+# means the model mostly sees stretched padding rather than real scene
+# content and finds nothing. At Sentinel-2's 10m/pixel resolution, a crop
+# needs at least this many km across to reach 256px.
+BIT_CD_MIN_TILE_PX = 256
+SENTINEL2_RES_M = 10
+BIT_CD_MIN_BUFFER_KM = round(BIT_CD_MIN_TILE_PX * SENTINEL2_RES_M / 1000, 2)  # 2.56
+
 import cv2
 import numpy as np
 import requests
@@ -434,6 +443,17 @@ def main():
     ap.add_argument("--no-describe", action="store_true")
     args = ap.parse_args()
 
+    if args.use_bit_cd and (args.lat is not None or args.lon is not None):
+        if args.buffer_km < BIT_CD_MIN_BUFFER_KM:
+            print(f"Note: --use-bit-cd needs at least a {BIT_CD_MIN_TILE_PX}x{BIT_CD_MIN_TILE_PX}px "
+                  f"crop to work properly (BIT_CD's training resolution) — at Sentinel-2's "
+                  f"~{SENTINEL2_RES_M}m/pixel, that means >= {BIT_CD_MIN_BUFFER_KM}km. Your "
+                  f"--buffer-km {args.buffer_km} would produce a "
+                  f"~{int(args.buffer_km*1000/SENTINEL2_RES_M)}x{int(args.buffer_km*1000/SENTINEL2_RES_M)}px "
+                  f"crop, which gets stretched with border-replicated padding and won't give BIT_CD "
+                  f"anything real to look at. Bumping --buffer-km to {BIT_CD_MIN_BUFFER_KM} for this run.")
+            args.buffer_km = BIT_CD_MIN_BUFFER_KM
+
     os.makedirs(args.out, exist_ok=True)
     ndvi_layer_full = None
     ndbi_layer_full = None
@@ -472,6 +492,12 @@ def main():
         args.no_align = True
     elif args.before and args.after:
         before, after = load_and_align(args.before, args.after)
+        if args.use_bit_cd and min(before.shape[:2]) < BIT_CD_MIN_TILE_PX:
+            print(f"Warning: your image is {before.shape[1]}x{before.shape[0]}px — smaller than "
+                  f"the {BIT_CD_MIN_TILE_PX}x{BIT_CD_MIN_TILE_PX}px BIT_CD was trained on. It will "
+                  f"be padded with replicated edge pixels rather than resized, so BIT_CD is mostly "
+                  f"looking at stretched padding and likely won't find real changes here. Use a "
+                  f"larger source image, or crop/tile a bigger region, for --use-bit-cd to work well.")
     else:
         ap.error("Provide either --before/--after, or --lat/--lon + date ranges")
 
