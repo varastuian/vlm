@@ -7,3 +7,6 @@ Dataset/
 change_output/
 bit_cd_output/
 *.egg-info/
+*.zip
+stac_cache
+categorized_output
