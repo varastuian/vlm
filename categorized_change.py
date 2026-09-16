@@ -3,6 +3,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 
 BIT_CD_MIN_TILE_PX = 256
@@ -184,6 +185,78 @@ def crop_region_bounds(img_shape, box, pad_ratio=0.3):
     return x1, y1, x2, y2
 
 
+def pixel_box_to_geo(box, image_shape, center_lat, center_lon, buffer_km):
+    """
+    Approximate lat/lon for a pixel box, given the STAC crop's known center
+    point and total width in km (this pipeline's --buffer-km IS the full
+    crop width, not a radius -- see the --target-px comment in main()).
+    Uses a flat-earth/equirectangular approximation local to center_lat,
+    which is accurate to a few meters over a crop this size (kilometers,
+    not hundreds of km) -- fine for "which region is this" purposes, not
+    for survey-grade coordinates.
+
+    Caveat: this assumes the fetched crop is square and centered exactly
+    on (center_lat, center_lon) with no extra internal padding/cropping.
+    If stac_fetch.py's actual window differs (e.g. non-square, or offset
+    to align to pixel/tile boundaries), these will be off by however much
+    that window differs from the naive assumption. Sanity-check by
+    confirming the center of the FULL image (not a region) maps back to
+    very close to (center_lat, center_lon) -- it does by construction here,
+    so the real thing to check is whether before_source.png's real-world
+    footprint matches --buffer-km.
+    """
+    x, y, w, h = box
+    H, W = image_shape[:2]
+    meters_per_px = (buffer_km * 1000.0) / W
+    deg_per_m_lat = 1.0 / 111_320.0
+    deg_per_m_lon = 1.0 / (111_320.0 * math.cos(math.radians(center_lat)))
+
+    def px_to_ll(px, py):
+        east_m = (px - W / 2.0) * meters_per_px
+        north_m = (H / 2.0 - py) * meters_per_px  # image rows increase southward
+        return (center_lat + north_m * deg_per_m_lat,
+                center_lon + east_m * deg_per_m_lon)
+
+    lat_c, lon_c = px_to_ll(x + w / 2.0, y + h / 2.0)
+    lat_n, lon_w = px_to_ll(x, y)
+    lat_s, lon_e = px_to_ll(x + w, y + h)
+    return {
+        "center_lat": lat_c, "center_lon": lon_c,
+        "lat_north": lat_n, "lat_south": lat_s,
+        "lon_west": lon_w, "lon_east": lon_e,
+    }
+
+
+def merge_location_into_result(result_text, boxes, region_geo):
+    """
+    Post-process the VLM's '#<n>: <category> — <description>' lines to
+    prepend real-world location: lat/lon + a Google Maps link in STAC
+    mode, or the pixel bbox as a fallback when there's no geo reference
+    (plain --before/--after file mode).
+    """
+    pattern = re.compile(r"^#(\d+):\s*(.*)$")
+    out_lines = []
+    for line in result_text.splitlines():
+        m = pattern.match(line.strip())
+        if not m:
+            out_lines.append(line)
+            continue
+        idx = int(m.group(1)) - 1
+        rest = m.group(2)
+        if region_geo is not None and 0 <= idx < len(region_geo):
+            g = region_geo[idx]
+            maps_url = f"https://www.google.com/maps?q={g['center_lat']:.6f},{g['center_lon']:.6f}"
+            out_lines.append(
+                f"#{idx+1} @ ({g['center_lat']:.5f}, {g['center_lon']:.5f}) [{maps_url}]: {rest}"
+            )
+        elif 0 <= idx < len(boxes):
+            x, y, w, h = boxes[idx]
+            out_lines.append(f"#{idx+1} @ pixel bbox (x={x}, y={y}, w={w}, h={h}): {rest}")
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 # Fixed 2-row x 3-column layout for the change-graph quadrants. Order here
 # controls draw order in change_graph_tile()/classify_and_describe(); keep
 # the two lists in sync if you reorder.
@@ -296,7 +369,8 @@ def encode_image_b64(img) -> str:
 
 
 def classify_and_describe(montage, n_regions, source_labels=None, model="qwen3-vl",
-                           ollama_url="http://localhost:11434", available_signals=None):
+                           ollama_url="http://localhost:11434", available_signals=None,
+                           timeout=240, keep_alive="10m"):
     hint_note = ""
     if source_labels and any(source_labels):
         parts = [f"#{i+1} ({'/'.join(tags)})" for i, tags in enumerate(source_labels) if tags]
@@ -355,8 +429,9 @@ def classify_and_describe(montage, n_regions, source_labels=None, model="qwen3-v
         "prompt": prompt,
         "images": [encode_image_b64(montage)],
         "stream": False,
+        "keep_alive": keep_alive,
     }
-    resp = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=240)
+    resp = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=timeout)
     resp.raise_for_status()
     return resp.json().get("response", "").strip()
 
@@ -454,7 +529,7 @@ def main():
     ap.add_argument("--bit-cd-repo", default=None)
 
     dino_group = ap.add_argument_group("DINOv2 semantic change (zero-shot, no training needed)")
-    dino_group.add_argument("--use-dino", default=True, action="store_true",
+    dino_group.add_argument("--use-dino", action="store_true",
                              help="OR a DINOv2 patch-embedding change map into region proposal. "
                                   "Unlike SSIM/color, this compares learned semantic content, so "
                                   "it's less fooled by sensor calibration drift / seasonal color "
@@ -486,6 +561,14 @@ def main():
 
     ap.add_argument("--model", default="qwen3-vl:4b")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--ollama-timeout", type=int, default=900,
+                     help="Seconds to wait for the Ollama response before giving up. Larger "
+                          "montages (more regions, --use-sam often proposes more than the "
+                          "contour fallback) take longer -- bump this if you see read timeouts, "
+                          "e.g. --ollama-timeout 600.")
+    ap.add_argument("--ollama-keep-alive", default="10m",
+                     help="How long Ollama keeps the model loaded after this request, so back-"
+                          "to-back runs don't pay model-load time again (Ollama's default is 5m).")
     ap.add_argument("--no-describe", action="store_true")
     args = ap.parse_args()
 
@@ -593,7 +676,6 @@ def main():
     dino_mask = None
     dino_layer_full = None
     if args.use_dino:
-        print("Using DINO")
         print(f"Running DINOv2 ({args.dino_model}) semantic change map...")
         dino_model, dino_device, dino_patch_size = dsc.load_dino(args.dino_model)
         if dino_model is not None:
@@ -665,6 +747,15 @@ def main():
     source_labels = label_box_sources(boxes, bit_cd_mask=bit_cd_mask, index_mask=index_mask,
                                        dino_mask=dino_mask, sam_scores=sam_scores)
 
+    region_geo = None
+    if stac_mode:
+        region_geo = [pixel_box_to_geo(b, before.shape, args.lat, args.lon, args.buffer_km)
+                      for b in boxes]
+        print("\n--- Region locations ---")
+        for i, g in enumerate(region_geo):
+            maps_url = f"https://www.google.com/maps?q={g['center_lat']:.6f},{g['center_lon']:.6f}"
+            print(f"#{i+1}: ({g['center_lat']:.5f}, {g['center_lon']:.5f})  {maps_url}")
+
     overlay = draw_overlay(after, boxes, source_labels, seg_masks=seg_masks)
     cv2.imwrite(os.path.join(args.out, "overlay.png"), overlay)
     cv2.imwrite(os.path.join(args.out, "mask.png"), mask)
@@ -699,11 +790,18 @@ def main():
         result = classify_and_describe(
             montage, len(boxes), source_labels=source_labels, model=args.model,
             ollama_url=args.ollama_url, available_signals=available_signals,
+            timeout=args.ollama_timeout, keep_alive=args.ollama_keep_alive,
         )
+        result = merge_location_into_result(result, boxes, region_geo)
         print("\n--- Per-region classification ---")
         print(result)
         with open(os.path.join(args.out, "regions.txt"), "w") as f:
             f.write(result)
+    except requests.exceptions.Timeout:
+        print(f"\nOllama request timed out after {args.ollama_timeout}s. The model may still be "
+              f"generating -- try again with a larger --ollama-timeout, or check `ollama ps` to "
+              f"see if {args.model} is still loaded/running.", file=sys.stderr)
+        sys.exit(1)
     except requests.exceptions.RequestException as e:
         print(f"\nCould not reach Ollama at {args.ollama_url}: {e}", file=sys.stderr)
         sys.exit(1)
