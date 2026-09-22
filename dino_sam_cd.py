@@ -168,7 +168,8 @@ def load_sam(checkpoint_path, model_type="vit_b", device=None,
 
 
 def sam_change_regions(after, change_map, mask_generator, min_change_score=0.2,
-                        min_area=100, max_regions=10):
+                        min_area=100, max_regions=10, candidate_mask=None,
+                        min_change_overlap=0.10):
     """
     Run SAM on `after`, score each resulting segment by its mean value in
     `change_map` (pass dino_change_map()'s output, or any other full-res
@@ -176,12 +177,20 @@ def sam_change_regions(after, change_map, mask_generator, min_change_score=0.2,
     a fallback when DINO isn't available), and return the top-scoring
     segments as (box_xywh, score, seg_mask_bool) tuples, sorted by score
     descending. `change_map` must be full-resolution, same H x W as `after`.
+    If `candidate_mask` is given, a segment must overlap it by at least
+    `min_change_overlap`; this keeps unrelated SAM objects out of the results.
     """
+    if candidate_mask is not None and candidate_mask.shape != change_map.shape:
+        raise ValueError("candidate_mask and change_map must have the same shape")
+    candidate = candidate_mask.astype(bool) if candidate_mask is not None else None
+
     masks = mask_generator.generate(after)
     scored = []
     for m in masks:
         seg = m["segmentation"]
         if seg.sum() < min_area:
+            continue
+        if candidate is not None and float(candidate[seg].mean()) < min_change_overlap:
             continue
         score = float(change_map[seg].mean())
         if score < min_change_score:

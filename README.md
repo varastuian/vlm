@@ -25,8 +25,19 @@ BIT_CD repo is required. See `vendor/bit_cd/NOTICE.md` for where it came from.
 
 ```bash
 pip install -r requirements.txt
-ollama pull qwen3-vl        # or whatever Qwen VL tag you use
+ollama pull qwen3-vl:4b-instruct   # non-thinking tag — see note below
 ```
+
+> **Which Qwen tag?** Use the non-thinking `qwen3-vl:4b-instruct` tag for the
+> VLM explanation step. The plain `qwen3-vl:4b` tag has Ollama's `thinking`
+> capability and reasons in a separate `thinking` channel before it answers.
+> Recent Ollama builds ignore the API's `think: false` for that tag (on both
+> `/api/generate` and `/api/chat`), so a modest token budget gets consumed
+> entirely by reasoning and the model returns **no answer text** — which looks
+> like "the VLM silently did nothing". If you only have `qwen3-vl:4b` pulled,
+> either pull the `-instruct` tag above, or pass a much larger
+> `--ollama-max-tokens` (the code auto-retries once at 4x the requested budget
+> when it detects thinking-only output).
 
 ## Usage
 

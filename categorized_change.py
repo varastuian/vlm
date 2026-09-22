@@ -1,810 +1,506 @@
+#!/usr/bin/env python3
+"""
+STAC change detection: DINOv2 + SAM, with NDVI/NDBI as supporting evidence,
+processed in small patches so it fits on a laptop.
+
+Flow
+  1. fetch_pair()    download ONLY the area window from Sentinel-2 COGs, once,
+                     and cache it as .npy files (re-runs never touch the network)
+  2. Scene           memory-maps the cache; patches are sliced lazily from disk
+  3. detect_patch()  per patch: DINO change map + index deltas -> fused score
+                     -> SAM proposes object-shaped regions
+  4. merge_regions() de-duplicate regions found in overlapping patches
+  5. classify()      montage (before | after | DINO | index) -> Ollama VLM
+
+Only dino_sam_cd.py is still needed from your old code base.
+"""
 import argparse
 import base64
+import gc
+import hashlib
+import itertools
 import json
-import math
 import os
 import re
 import sys
-
-BIT_CD_MIN_TILE_PX = 256
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import requests
-from skimage.metrics import structural_similarity as ssim
 
-# Reuse the alignment logic already validated in main2.py
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from main2 import load_and_align, align_images  # noqa: E402
-import dino_sam_cd as dsc  # noqa: E402
+import dino_sam_cd as dsc  # load_dino, dino_change_map, load_sam, sam_change_regions
 
-
-def compute_generic_change_mask(before, after, blur_ksize=5, ssim_thresh=0.88,
-                                 color_thresh=18, min_area=100):
-    """
-    Category-agnostic change mask combining two independent signals so
-    neither one's blind spot silently drops real changes:
-      - grayscale SSIM: catches structural/shape/texture changes
-        (construction, demolition, new objects, roads)
-      - Lab color distance: catches same-luminance HUE changes that SSIM
-        misses entirely (e.g. vegetation turning brown/bare — a classic
-        deforestation signature can have nearly identical grayscale
-        structure but a big color shift)
-    A pixel is flagged as changed if EITHER signal fires.
-    """
-    g1 = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
-    g1b = cv2.GaussianBlur(g1, (blur_ksize, blur_ksize), 0)
-    g2b = cv2.GaussianBlur(g2, (blur_ksize, blur_ksize), 0)
-
-    _, diff_map = ssim(g1b, g2b, full=True)
-    dissimilarity = ((1.0 - diff_map) * 127.5).astype(np.uint8)
-    thresh_val = int((1.0 - ssim_thresh) * 127.5)
-    _, struct_mask = cv2.threshold(dissimilarity, thresh_val, 255, cv2.THRESH_BINARY)
-
-    lab1 = cv2.cvtColor(before, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab2 = cv2.cvtColor(after, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab1 = cv2.GaussianBlur(lab1, (blur_ksize, blur_ksize), 0)
-    lab2 = cv2.GaussianBlur(lab2, (blur_ksize, blur_ksize), 0)
-    color_dist = np.linalg.norm(lab1 - lab2, axis=2)
-    _, color_mask = cv2.threshold(color_dist, color_thresh, 255, cv2.THRESH_BINARY)
-    color_mask = color_mask.astype(np.uint8)
-
-    mask = cv2.bitwise_or(struct_mask, color_mask)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= min_area]
-    changed_pct = 100.0 * np.count_nonzero(mask) / mask.size
-    return mask, boxes, changed_pct
+BANDS = ("red", "green", "blue", "nir", "swir16", "scl")
+SCL_INVALID = (0, 1, 3, 8, 9, 10)  # no-data, saturated, cloud shadow, cloud (med/high), cirrus
+MAX_SEG_FRAC = 0.35                # drop SAM segments covering >35% of a patch (terrain/fields)
+TILE = 200                         # px per panel in the VLM montage
+PANELS = ("BEFORE", "AFTER", "DINO", "INDEX")
 
 
-def compute_index_change_map(before_idx, after_idx, ndvi_thresh=0.15, ndbi_thresh=0.15):
-    """
-    Given before/after NDVI/NDBI/NDWI dicts (from stac_fetch.fetch_scene_with_indices),
-    return the raw deltas plus a binary mask of pixels where NDVI or NDBI
-    moved past threshold — fed into region proposal alongside the generic
-    SSIM/color mask so spectral-only changes (invisible in the true-color
-    composite) still get picked up as candidate regions.
-    """
-    dndvi = after_idx["ndvi"] - before_idx["ndvi"]
-    dndbi = after_idx["ndbi"] - before_idx["ndbi"]
-    index_mask = (((np.abs(dndvi) > ndvi_thresh) | (np.abs(dndbi) > ndbi_thresh))
-                  .astype(np.uint8) * 255)
-    return dndvi, dndbi, index_mask
+# --------------------------------------------------------------------------- #
+# 1. STAC download + cache
+# --------------------------------------------------------------------------- #
+def fetch_pair(args):
+    """Download the before/after window once and cache it. Returns the cache folder."""
+    key = hashlib.md5(json.dumps([
+        round(args.lat, 5), round(args.lon, 5), args.size_px, args.before, args.after,
+        args.max_cloud, args.collection, args.stac_url]).encode()).hexdigest()[:12]
+    folder = os.path.join(args.cache_dir, key)
+    if os.path.exists(os.path.join(folder, "meta.json")):  # meta.json is written last
+        print(f"Using cached scenes: {folder}")
+        return folder
+    os.makedirs(folder, exist_ok=True)
+
+    import rasterio
+    import rasterio.windows as rw
+    from pystac_client import Client
+    from rasterio.enums import Resampling
+    from rasterio.warp import transform as warp_transform
+
+    client = Client.open(args.stac_url)
+    point = {"type": "Point", "coordinates": [args.lon, args.lat]}
+
+    def pick(dates, grid=None):
+        items = list(client.search(
+            collections=[args.collection], intersects=point, datetime=dates,
+            query={"eo:cloud_cover": {"lt": args.max_cloud}}, max_items=50).items())
+        if grid:  # same MGRS tile => identical pixel grid, so before/after align exactly
+            items = [i for i in items if i.properties.get("grid:code") == grid]
+        if not items:
+            sys.exit(f"No scene for {dates}" + (f" on tile {grid}" if grid else "")
+                     + f" with cloud cover < {args.max_cloud}%.")
+        return min(items, key=lambda i: i.properties.get("eo:cloud_cover", 100))
+
+    items = {"before": pick(args.before)}
+    items["after"] = pick(args.after, items["before"].properties.get("grid:code"))
+    for when, it in items.items():
+        print(f"{when:6s}: {it.id}  {it.properties['datetime'][:10]}  "
+              f"cloud={it.properties.get('eo:cloud_cover', '?')}%")
+
+    env = rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+                       CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.tiff",
+                       GDAL_HTTP_MULTIPLEX="YES", GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES")
+    with env:
+        # Reference 10 m grid + window centred on the point (clipped to the tile).
+        with rasterio.open(items["before"].assets["red"].href) as src:
+            ref_transform, ref_crs = src.transform, src.crs
+            x, y = warp_transform("EPSG:4326", src.crs, [args.lon], [args.lat])
+            col, row = ~src.transform * (x[0], y[0])
+            half = args.size_px // 2
+            win = rw.Window(int(col) - half, int(row) - half, args.size_px, args.size_px)
+            win = win.intersection(rw.Window(0, 0, src.width, src.height))
+        win = rw.Window(int(win.col_off), int(win.row_off), int(win.width), int(win.height))
+        H, W = int(win.height), int(win.width)
+        if (H, W) != (args.size_px, args.size_px):
+            print(f"Note: point is near the tile edge, window clipped to {W}x{H}px.")
+
+        def read(item, name):
+            resampling = Resampling.nearest if name == "scl" else Resampling.bilinear
+            with rasterio.open(item.assets[name].href) as src:
+                if src.crs != ref_crs:
+                    sys.exit("Before/after scenes use different CRS; pick another date range.")
+                if src.res[0] == 10 and src.transform != ref_transform:
+                    sys.exit("Before/after 10 m grids differ; pick another date range.")
+                if src.transform == ref_transform:
+                    w = win
+                else:  # 20 m bands (swir16, scl): same ground window, upsampled to 10 m
+                    w = rw.from_bounds(*rw.bounds(win, ref_transform), transform=src.transform)
+                return src.read(1, window=w, out_shape=(H, W), resampling=resampling)
+
+        for when, it in items.items():
+            for name in BANDS:
+                print(f"  downloading {when}/{name}")
+                np.save(os.path.join(folder, f"{when}_{name}.npy"), read(it, name))
+
+    def radiometry(item):
+        rb = (item.assets["red"].extra_fields.get("raster:bands") or [{}])[0]
+        try:
+            baseline = float(item.properties.get("s2:processing_baseline") or 0)
+        except ValueError:
+            baseline = 0.0
+        return {"scale": rb.get("scale", 1e-4),
+                "offset": rb.get("offset", -0.1 if baseline >= 4.0 else 0.0)}
+
+    meta = {
+        "size": [H, W],
+        "crs": ref_crs.to_string(),
+        "transform": list(tuple(rw.transform(win, ref_transform))[:6]),
+        "before": {"id": items["before"].id, **radiometry(items["before"])},
+        "after": {"id": items["after"].id, **radiometry(items["after"])},
+    }
+    with open(os.path.join(folder, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    return folder
 
 
-def _colorize_diverging_full(delta, pos_bgr, neg_bgr):
-    """delta: full-scene float array. Positive values tint pos_bgr, negative
-    values tint neg_bgr, magnitude controls intensity. Zero delta = black."""
-    pos = np.clip(delta, 0, 1)
-    neg = np.clip(-delta, 0, 1)
-    img = np.zeros((*delta.shape, 3), dtype=np.float32)
-    for c in range(3):
-        img[..., c] = pos * (pos_bgr[c] / 255.0) + neg * (neg_bgr[c] / 255.0)
-    return np.clip(img * 255, 0, 255).astype(np.uint8)
+# --------------------------------------------------------------------------- #
+# 2. Scene: lazy, memory-mapped access to the cache
+# --------------------------------------------------------------------------- #
+class Scene:
+    def __init__(self, folder):
+        with open(os.path.join(folder, "meta.json")) as f:
+            self.meta = json.load(f)
+        self.h, self.w = self.meta["size"]
+        self.raw = {(when, b): np.load(os.path.join(folder, f"{when}_{b}.npy"), mmap_mode="r")
+                    for when in ("before", "after") for b in BANDS}
+
+    def _refl(self, when, band, sl):
+        m = self.meta[when]
+        arr = self.raw[(when, band)][sl].astype(np.float32)
+        return np.clip(arr * m["scale"] + m["offset"], 0.0, 1.0)
+
+    def rgb(self, when, sl):
+        """BGR uint8 with a FIXED stretch, so before/after (and all patches) are comparable."""
+        b, g, r = (self._refl(when, n, sl) for n in ("blue", "green", "red"))
+        img = np.clip(np.dstack([b, g, r]) / 0.3, 0, 1) ** 0.7
+        return (img * 255).astype(np.uint8)
+
+    def indices(self, when, sl):
+        red, nir, swir = (self._refl(when, n, sl) for n in ("red", "nir", "swir16"))
+        ndvi = (nir - red) / np.maximum(nir + red, 0.01)
+        ndbi = (swir - nir) / np.maximum(swir + nir, 0.01)
+        return ndvi, ndbi
+
+    def valid(self, sl):
+        """False where either date has cloud / shadow / no-data (slightly dilated)."""
+        bad = (np.isin(self.raw[("before", "scl")][sl], SCL_INVALID)
+               | np.isin(self.raw[("after", "scl")][sl], SCL_INVALID)).astype(np.uint8)
+        bad = cv2.dilate(bad, np.ones((5, 5), np.uint8))
+        return bad == 0
+
+    def latlon(self, col, row):
+        from rasterio.transform import Affine
+        from rasterio.warp import transform
+        x, y = Affine(*self.meta["transform"]) * (col, row)
+        lon, lat = transform(self.meta["crs"], "EPSG:4326", [x], [y])
+        return lat[0], lon[0]
 
 
-def _colorize_single_sided_full(delta, bgr):
-    """delta: full-scene float array. Only positive values shown, tinted bgr."""
-    pos = np.clip(delta, 0, 1)
-    img = np.zeros((*delta.shape, 3), dtype=np.float32)
-    for c in range(3):
-        img[..., c] = pos * (bgr[c] / 255.0)
-    return np.clip(img * 255, 0, 255).astype(np.uint8)
+def _starts(n, size, step):
+    if n <= size:
+        return [0]
+    s = list(range(0, n - size + 1, step))
+    if s[-1] + size < n:
+        s.append(n - size)
+    return s
 
 
-def compute_generic_change_score_full(before, after, blur_ksize=5):
-    """
-    Full-scene generic change-intensity score in [0, 1] (grayscale SSIM
-    dissimilarity + Lab color distance, averaged). Raw float, no
-    colorization — this is what compute_generic_heatmap_full() colorizes,
-    and it also doubles as the fallback score map for SAM region scoring
-    when --use-dino isn't enabled.
-    """
-    g1 = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
-    g1b = cv2.GaussianBlur(g1, (blur_ksize, blur_ksize), 0)
-    g2b = cv2.GaussianBlur(g2, (blur_ksize, blur_ksize), 0)
-    _, diff_map = ssim(g1b, g2b, full=True)
-    struct_dissim = 1.0 - diff_map
-
-    lab1 = cv2.cvtColor(before, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab2 = cv2.cvtColor(after, cv2.COLOR_BGR2LAB).astype(np.float32)
-    color_dist = np.linalg.norm(lab1 - lab2, axis=2)
-    color_norm = color_dist / (color_dist.max() + 1e-6)
-
-    return np.clip(0.5 * struct_dissim + 0.5 * color_norm, 0, 1)
+# --------------------------------------------------------------------------- #
+# 3. Per-patch detection: DINO + indices -> fused score -> SAM regions
+# --------------------------------------------------------------------------- #
+@dataclass
+class Region:
+    box: tuple      # (x, y, w, h) in full-scene pixels
+    score: float
+    stats: dict     # mean DINO / dNDVI / dNDBI inside the SAM segment
+    row: np.ndarray # small before|after|dino|index strip for the VLM montage
+    contours: list # segment outline in full-scene pixels (for the overlay)
 
 
-def compute_generic_heatmap_full(before, after, blur_ksize=5):
-    """JET-colorized version of compute_generic_change_score_full(), for the montage."""
-    combined = compute_generic_change_score_full(before, after, blur_ksize)
-    heat = (combined * 255).astype(np.uint8)
-    return cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+def index_composite(dndvi, dndbi):
+    """BGR: red = vegetation loss, green = vegetation gain, blue = more built-up/bare."""
+    b = np.clip(dndbi / 0.4, 0, 1)
+    g = np.clip(dndvi / 0.4, 0, 1)
+    r = np.clip(-dndvi / 0.4, 0, 1)
+    return (np.dstack([b, g, r]) * 255).astype(np.uint8)
 
 
-def merge_overlapping_boxes(boxes, pad=10, iou_merge_thresh=0.05):
-    """Merge boxes that overlap or sit close together (after padding), so one
-    real changed object doesn't get split into several fragments."""
-    if not boxes:
+def evidence_row(before, after, heat, idx_rgb, box, seg, pad=0.3):
+    x, y, w, h = box
+    H, W = before.shape[:2]
+    px, py = int(w * pad), int(h * pad)
+    x1, y1, x2, y2 = max(0, x - px), max(0, y - py), min(W, x + w + px), min(H, y + h + py)
+    seg_t = cv2.resize(seg[y1:y2, x1:x2].astype(np.uint8), (TILE, TILE),
+                       interpolation=cv2.INTER_NEAREST)
+    cnts, _ = cv2.findContours(seg_t, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    panels = []
+    for img, outline in ((before, True), (after, True), (heat, False), (idx_rgb, False)):
+        p = cv2.resize(img[y1:y2, x1:x2], (TILE, TILE), interpolation=cv2.INTER_LINEAR)
+        if outline:
+            cv2.drawContours(p, cnts, -1, (0, 255, 255), 1)
+        panels.append(p)
+    return np.hstack(panels)
+
+
+def detect_patch(scene, y0, x0, models, args):
+    sl = (slice(y0, min(y0 + args.patch_px, scene.h)), slice(x0, min(x0 + args.patch_px, scene.w)))
+    before, after = scene.rgb("before", sl), scene.rgb("after", sl)
+    valid = scene.valid(sl)
+    nb, bb = scene.indices("before", sl)
+    na, ba = scene.indices("after", sl)
+    dndvi = cv2.GaussianBlur(na - nb, (5, 5), 0) * valid
+    dndbi = cv2.GaussianBlur(ba - bb, (5, 5), 0) * valid
+    idx_mag = np.maximum(np.abs(dndvi), np.abs(dndbi))
+
+    dino_map = dsc.dino_change_map(before, after, *models["dino"])
+    if dino_map.shape != valid.shape:
+        dino_map = cv2.resize(dino_map, (valid.shape[1], valid.shape[0]))
+    dino_map = dino_map * valid
+
+    # A pixel is a candidate if EITHER the semantic or the spectral signal fires.
+    cand = ((dino_map > args.dino_thresh) | (idx_mag > args.index_thresh)).astype(np.uint8) * 255
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    if np.count_nonzero(cand) < args.min_area:
         return []
-    padded = [(x - pad, y - pad, x + w + pad, y + h + pad) for (x, y, w, h) in boxes]
-    merged = True
-    while merged:
-        merged = False
-        out = []
-        used = [False] * len(padded)
-        for i in range(len(padded)):
-            if used[i]:
-                continue
-            x1, y1, x2, y2 = padded[i]
-            for j in range(i + 1, len(padded)):
-                if used[j]:
-                    continue
-                bx1, by1, bx2, by2 = padded[j]
-                # overlap test
-                if x1 < bx2 and bx1 < x2 and y1 < by2 and by1 < y2:
-                    x1, y1, x2, y2 = min(x1, bx1), min(y1, by1), max(x2, bx2), max(y2, by2)
-                    used[j] = True
-                    merged = True
-            out.append((x1, y1, x2, y2))
-            used[i] = True
-        padded = out
-    return [(x1, y1, x2 - x1, y2 - y1) for (x1, y1, x2, y2) in padded]
 
+    # Fused score used by SAM to rank segments: DINO leads, indices back it up.
+    score_map = (0.7 * np.clip(dino_map / 0.6, 0, 1)
+                 + 0.3 * np.clip(idx_mag / 0.4, 0, 1)).astype(np.float32)
+    found = dsc.sam_change_regions(
+        after, score_map, models["sam"], min_change_score=args.min_score,
+        min_area=args.min_area, max_regions=args.per_patch, candidate_mask=cand,
+        min_change_overlap=args.min_overlap)
+    if not found:
+        return []
 
-def select_top_regions(boxes, max_regions=10):
-    """Keep the largest N regions so the VLM prompt/montage stays manageable."""
-    boxes_sorted = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-    return boxes_sorted[:max_regions]
+    heat = cv2.applyColorMap((np.clip(dino_map / 0.8, 0, 1) * 255).astype(np.uint8),
+                             cv2.COLORMAP_JET)
+    idx_rgb = index_composite(dndvi, dndbi)
 
-
-def crop_with_context(img, box, pad_ratio=0.3, tile_size=200):
-    x, y, w, h = box
-    H, W = img.shape[:2]
-    pad_x, pad_y = int(w * pad_ratio), int(h * pad_ratio)
-    x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-    x2, y2 = min(W, x + w + pad_x), min(H, y + h + pad_y)
-    crop = img[y1:y2, x1:x2]
-    return cv2.resize(crop, (tile_size, tile_size), interpolation=cv2.INTER_AREA)
-
-
-def crop_region_bounds(img_shape, box, pad_ratio=0.3):
-    """Same padded-region math as crop_with_context, but returns the pixel
-    bounds instead of the crop — used to slice the SAME region out of both
-    images, the diff mask, and any per-segment SAM mask consistently."""
-    x, y, w, h = box
-    H, W = img_shape[:2]
-    pad_x, pad_y = int(w * pad_ratio), int(h * pad_ratio)
-    x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-    x2, y2 = min(W, x + w + pad_x), min(H, y + h + pad_y)
-    return x1, y1, x2, y2
-
-
-def pixel_box_to_geo(box, image_shape, center_lat, center_lon, buffer_km):
-    """
-    Approximate lat/lon for a pixel box, given the STAC crop's known center
-    point and total width in km (this pipeline's --buffer-km IS the full
-    crop width, not a radius -- see the --target-px comment in main()).
-    Uses a flat-earth/equirectangular approximation local to center_lat,
-    which is accurate to a few meters over a crop this size (kilometers,
-    not hundreds of km) -- fine for "which region is this" purposes, not
-    for survey-grade coordinates.
-
-    Caveat: this assumes the fetched crop is square and centered exactly
-    on (center_lat, center_lon) with no extra internal padding/cropping.
-    If stac_fetch.py's actual window differs (e.g. non-square, or offset
-    to align to pixel/tile boundaries), these will be off by however much
-    that window differs from the naive assumption. Sanity-check by
-    confirming the center of the FULL image (not a region) maps back to
-    very close to (center_lat, center_lon) -- it does by construction here,
-    so the real thing to check is whether before_source.png's real-world
-    footprint matches --buffer-km.
-    """
-    x, y, w, h = box
-    H, W = image_shape[:2]
-    meters_per_px = (buffer_km * 1000.0) / W
-    deg_per_m_lat = 1.0 / 111_320.0
-    deg_per_m_lon = 1.0 / (111_320.0 * math.cos(math.radians(center_lat)))
-
-    def px_to_ll(px, py):
-        east_m = (px - W / 2.0) * meters_per_px
-        north_m = (H / 2.0 - py) * meters_per_px  # image rows increase southward
-        return (center_lat + north_m * deg_per_m_lat,
-                center_lon + east_m * deg_per_m_lon)
-
-    lat_c, lon_c = px_to_ll(x + w / 2.0, y + h / 2.0)
-    lat_n, lon_w = px_to_ll(x, y)
-    lat_s, lon_e = px_to_ll(x + w, y + h)
-    return {
-        "center_lat": lat_c, "center_lon": lon_c,
-        "lat_north": lat_n, "lat_south": lat_s,
-        "lon_west": lon_w, "lon_east": lon_e,
-    }
-
-
-def merge_location_into_result(result_text, boxes, region_geo):
-    """
-    Post-process the VLM's '#<n>: <category> — <description>' lines to
-    prepend real-world location: lat/lon + a Google Maps link in STAC
-    mode, or the pixel bbox as a fallback when there's no geo reference
-    (plain --before/--after file mode).
-    """
-    pattern = re.compile(r"^#(\d+):\s*(.*)$")
-    out_lines = []
-    for line in result_text.splitlines():
-        m = pattern.match(line.strip())
-        if not m:
-            out_lines.append(line)
+    regions = []
+    for box, score, seg in found:
+        seg = np.asarray(seg).astype(bool)
+        if not seg.any() or seg.mean() > MAX_SEG_FRAC:
             continue
-        idx = int(m.group(1)) - 1
-        rest = m.group(2)
-        if region_geo is not None and 0 <= idx < len(region_geo):
-            g = region_geo[idx]
-            maps_url = f"https://www.google.com/maps?q={g['center_lat']:.6f},{g['center_lon']:.6f}"
-            out_lines.append(
-                f"#{idx+1} @ ({g['center_lat']:.5f}, {g['center_lon']:.5f}) [{maps_url}]: {rest}"
-            )
-        elif 0 <= idx < len(boxes):
-            x, y, w, h = boxes[idx]
-            out_lines.append(f"#{idx+1} @ pixel bbox (x={x}, y={y}, w={w}, h={h}): {rest}")
-        else:
-            out_lines.append(line)
-    return "\n".join(out_lines)
+        cnts, _ = cv2.findContours(seg.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE, offset=(x0, y0))
+        regions.append(Region(
+            box=(box[0] + x0, box[1] + y0, box[2], box[3]),
+            score=float(score),
+            stats={"dino": float(dino_map[seg].mean()),
+                   "dndvi": float(dndvi[seg].mean()),
+                   "dndbi": float(dndbi[seg].mean())},
+            row=evidence_row(before, after, heat, idx_rgb, box, seg),
+            contours=list(cnts)))
+    return regions
 
 
-# Fixed 2-row x 3-column layout for the change-graph quadrants. Order here
-# controls draw order in change_graph_tile()/classify_and_describe(); keep
-# the two lists in sync if you reorder.
-CHANGE_GRAPH_LAYERS = ["bit_cd", "ndvi", "dino"]
-CHANGE_GRAPH_LAYERS_ROW2 = ["ndbi", "generic", "sam_overlay"]
+def _overlap_of_smaller(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = min(ax + aw, bx + bw) - max(ax, bx)
+    ih = min(ay + ah, by + bh) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / min(aw * ah, bw * bh)
 
 
-def change_graph_tile(before, after, box, layers, seg_mask=None, pad_ratio=0.3, tile_size=200):
-    """
-    Build ONE composite "change graph" for a region: a fixed 2x3 grid so
-    Qwen sees every available signal at once, at consistent positions:
-        top:    BIT_CD building-change mask | NDVI change | DINO semantic change
-        bottom: NDBI change | generic structural/color heatmap | SAM segment overlay
-    Any signal not computed for this run (BIT_CD/NDVI/NDBI need the right
-    flags/mode; DINO needs --use-dino; SAM overlay needs --use-sam AND this
-    particular region needs to have come from a SAM segment) shows as solid
-    gray in that quadrant — gray means "not computed", NOT "no change"
-    (which shows as black/dark). `generic` is always present.
-    """
-    x1, y1, x2, y2 = crop_region_bounds(before.shape, box, pad_ratio)
-    half = tile_size // 2
-    gray = np.full((half, half, 3), 128, dtype=np.uint8)
-
-    def crop_or_gray(full_img):
-        if full_img is None:
-            return gray
-        crop = full_img[y1:y2, x1:x2]
-        return cv2.resize(crop, (half, half), interpolation=cv2.INTER_NEAREST)
-
-    def sam_overlay_or_gray():
-        if layers.get("sam_overlay_enabled") and seg_mask is not None:
-            after_crop = after[y1:y2, x1:x2]
-            seg_crop = seg_mask[y1:y2, x1:x2]
-            blended = dsc.sam_mask_overlay(after_crop, seg_crop)
-            return cv2.resize(blended, (half, half), interpolation=cv2.INTER_NEAREST)
-        return gray
-
-    row1 = np.hstack([
-        crop_or_gray(layers.get("bit_cd")),
-        crop_or_gray(layers.get("ndvi")),
-        crop_or_gray(layers.get("dino")),
-    ])
-    row2 = np.hstack([
-        crop_or_gray(layers.get("ndbi")),
-        crop_or_gray(layers.get("generic")),  # always present upstream
-        sam_overlay_or_gray(),
-    ])
-    return np.vstack([row1, row2])
+def merge_regions(regions, max_regions, overlap=0.5):
+    """Patches overlap, so the same object can be found twice: keep the best-scoring copy."""
+    kept = []
+    for r in sorted(regions, key=lambda r: r.score, reverse=True):
+        if all(_overlap_of_smaller(r.box, k.box) < overlap for k in kept):
+            kept.append(r)
+        if len(kept) == max_regions:
+            break
+    return kept
 
 
-def build_montage(before, after, boxes, tile_size=200, label_h=28, layers=None, seg_masks=None):
-    """
-    N x 3 grid: row i = [before_crop_i | after_crop_i | change_graph_i], each
-    row numbered. The third column is a 2x3 composite of every available
-    change signal (BIT_CD / NDVI / DINO / NDBI / generic / SAM overlay — see
-    change_graph_tile) so Qwen can weigh them together instead of picking
-    one signal to show.
-    """
-    layers = layers or {}
-    seg_masks = seg_masks or [None] * len(boxes)
-    n = len(boxes)
-    cell_h = tile_size + label_h
-    half = tile_size // 2
-    graph_w = half * 3
-    montage = np.full((cell_h * n, tile_size * 2 + graph_w, 3), 255, dtype=np.uint8)
-
-    for i, box in enumerate(boxes):
-        b_crop = crop_with_context(before, box, tile_size=tile_size)
-        a_crop = crop_with_context(after, box, tile_size=tile_size)
-        graph = change_graph_tile(before, after, box, layers, seg_mask=seg_masks[i],
-                                   tile_size=tile_size)
-        y0 = i * cell_h
-        cv2.putText(montage, f"#{i+1} BEFORE", (5, y0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
-        cv2.putText(montage, f"#{i+1} AFTER", (tile_size + 5, y0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
-        cv2.putText(montage, f"#{i+1} CHANGE GRAPH", (tile_size * 2 + 5, y0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-        montage[y0 + label_h:y0 + cell_h, 0:tile_size] = b_crop
-        montage[y0 + label_h:y0 + cell_h, tile_size:tile_size * 2] = a_crop
-        montage[y0 + label_h:y0 + cell_h, tile_size * 2:tile_size * 2 + graph_w] = graph
-
-    return montage
-
-
-def draw_overlay(after, boxes, source_labels=None, seg_masks=None):
-    overlay = after.copy()
-    seg_masks = seg_masks or [None] * len(boxes)
-    for i, (x, y, w, h) in enumerate(boxes):
-        color = (0, 0, 255)
-        if seg_masks[i] is not None:
-            contours, _ = cv2.findContours(seg_masks[i].astype(np.uint8), cv2.RETR_EXTERNAL,
-                                            cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, color, 2)
-        else:
-            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 2)
-        label = f"#{i+1}"
-        if source_labels and source_labels[i]:
-            label += f" [{'/'.join(source_labels[i])}]"
-        cv2.putText(overlay, label, (x, max(0, y - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    return overlay
-
-
-def encode_image_b64(img) -> str:
-    ok, buf = cv2.imencode(".jpg", img)
-    if not ok:
-        raise RuntimeError("Failed to encode image")
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
-
-
-def classify_and_describe(montage, n_regions, source_labels=None, model="qwen3-vl",
-                           ollama_url="http://localhost:11434", available_signals=None,
-                           timeout=240, keep_alive="10m"):
-    hint_note = ""
-    if source_labels and any(source_labels):
-        parts = [f"#{i+1} ({'/'.join(tags)})" for i, tags in enumerate(source_labels) if tags]
-        if parts:
-            hint_note = ("\nNote: region(s) " + ", ".join(parts) + " were independently "
-                         "flagged by a specialist detector (building = BIT_CD building-change "
-                         "model, index = spectral NDVI/NDBI change, semantic = DINO embedding "
-                         "change, sam = SAM segment selected by change score) — treat as a "
-                         "hint, not a certainty; verify visually.")
-
-    available_signals = available_signals or set()
-    computed = ", ".join(sorted(available_signals)) if available_signals else "generic only"
-    all_signals = {"bit_cd", "ndvi", "ndbi", "dino", "sam_overlay"}
-    not_computed = all_signals - available_signals
-    gray_note = (f" Signals NOT computed this run: {', '.join(sorted(not_computed))} — their "
-                 f"quadrant will show as solid gray, meaning 'not available', NOT 'no change'."
-                 if not_computed else "")
-
-    map_explainer = (
-        "a CHANGE GRAPH: a fixed 2x3 grid combining every available change signal so you can "
-        "weigh them together, always in this layout:\n"
-        "  top-left     = BIT_CD building-change mask (white = flagged as a building change)\n"
-        "  top-middle   = NDVI change (green = vegetation gain, red = vegetation loss/deforestation)\n"
-        "  top-right    = DINO semantic-change heatmap (a frozen vision model's embedding "
-        "distance between before/after; red/yellow = the content at that spot is semantically "
-        "different, not just visually noisier — more reliable than raw pixel difference for "
-        "distinguishing real change from lighting/sensor/seasonal shifts)\n"
-        "  bottom-left  = NDBI change (blue = new built-up/bare surface, i.e. construction)\n"
-        "  bottom-middle= generic structural/color change heatmap (red/yellow = strong change, "
-        "always present)\n"
-        "  bottom-right = SAM segment overlay (yellow outline/fill = the exact object boundary "
-        "this candidate region came from, when region proposal used Segment Anything)\n"
-        f"Computed this run: {computed}.{gray_note}\n"
-        "Weigh whichever quadrants are populated together — e.g. strong top-right (DINO) plus "
-        "strong top-middle (NDVI) usually means vegetation loss/deforestation; strong bottom-left "
-        "(NDBI) plus top-left (BIT_CD) usually means new construction. A region with a strong "
-        "DINO signal but weak/gray everything else is still meaningful — it means the content "
-        "changed semantically even if pixel-level structure/color didn't move much."
-    )
-
-    prompt = (
-        f"This image is a grid of {n_regions} numbered rows, each with 3 crops of "
-        f"the same candidate changed region: BEFORE, AFTER, and {map_explainer}\n"
-        "For EACH numbered region, on its own line, give:\n"
-        "  #<number>: <category> — <one-sentence description>\n"
-        "Category must be one of: building (construction/demolition), "
-        "vegetation (growth/loss/deforestation), road/infrastructure, "
-        "vehicle/object, water, no significant change, other.\n"
-        "If the change graph shows only weak/scattered/gray signal with no clear "
-        "before/after difference, say 'no significant change' rather than "
-        "inventing a category."
-        + hint_note
-    )
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "images": [encode_image_b64(montage)],
-        "stream": False,
-        "keep_alive": keep_alive,
-    }
-    resp = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json().get("response", "").strip()
-
-
-def get_bit_cd_mask(before, after, bit_cd_repo=None):
-    """
-    Run BIT_CD tiled inference and return its full building-change mask
-    (same H x W as the input images, 0/255). Feeds directly into region
-    proposal (OR'd with the other masks) instead of only labeling regions
-    found by other detectors.
-    """
+def free_memory():
+    gc.collect()
     try:
-        import bit_cd_infer as bit
         import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except ImportError:
-        print("Warning: bit_cd_infer.py / torch not available, skipping --use-bit-cd",
-              file=sys.stderr)
-        return None
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    repo = bit_cd_repo or bit.DEFAULT_VENDOR_PATH
-    checkpoint = os.path.join(repo, "checkpoints", "BIT_LEVIR", "best_ckpt.pt")
-    model = bit.load_bit_cd_model(repo, checkpoint, "base_transformer_pos_s4_dd8_dedim8", device)
-    mask, _, _ = bit.predict_change_mask(model, before, after, device)
-    return mask
+        pass
 
 
-def label_box_sources(boxes, bit_cd_mask=None, index_mask=None, dino_mask=None,
-                       sam_scores=None, overlap_thresh=0.15):
-    """For each final region, note which detector(s) actually fired there —
-    used both for the overlay label and as a hint in the VLM prompt."""
-    labels = []
-    for i, (x, y, w, h) in enumerate(boxes):
-        tags = []
-        if bit_cd_mask is not None:
-            region = bit_cd_mask[y:y + h, x:x + w]
-            if region.size and np.count_nonzero(region) / region.size > overlap_thresh:
-                tags.append("building")
-        if index_mask is not None:
-            region = index_mask[y:y + h, x:x + w]
-            if region.size and np.count_nonzero(region) / region.size > overlap_thresh:
-                tags.append("index")
-        if dino_mask is not None:
-            region = dino_mask[y:y + h, x:x + w]
-            if region.size and np.count_nonzero(region) / region.size > overlap_thresh:
-                tags.append("semantic")
-        if sam_scores is not None and sam_scores[i] is not None:
-            tags.append(f"sam:{sam_scores[i]:.2f}")
-        labels.append(tags)
-    return labels
+# --------------------------------------------------------------------------- #
+# 4. VLM classification (batched so the 4B model sees only a few regions at once)
+# --------------------------------------------------------------------------- #
+def build_montage(regions, first):
+    rows = []
+    for i, r in enumerate(regions, start=first):
+        bar = np.full((22, TILE * len(PANELS), 3), 255, np.uint8)
+        for c, name in enumerate(PANELS):
+            cv2.putText(bar, f"#{i} {name}", (c * TILE + 5, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        rows += [bar, r.row]
+    return np.vstack(rows)
+
+
+def make_prompt(regions, first):
+    stats = "\n".join(
+        f"  #{i}: DINO={r.stats['dino']:.2f}  dNDVI={r.stats['dndvi']:+.2f}  "
+        f"dNDBI={r.stats['dndbi']:+.2f}" for i, r in enumerate(regions, start=first))
+    return (
+        f"Sentinel-2 imagery (10 m/pixel). The image has {len(regions)} rows, regions "
+        f"#{first}-#{first + len(regions) - 1}. Each row has 4 panels: BEFORE, AFTER, DINO, INDEX. "
+        "A yellow outline on BEFORE/AFTER marks the candidate segment.\n"
+        "DINO = semantic change heatmap (red/yellow = content differs, blue = same).\n"
+        "INDEX = spectral change: red = vegetation loss, green = vegetation gain, "
+        "blue = more built-up/bare surface, magenta = vegetation replaced by built-up/bare "
+        "(typical construction or clearing), black = no index change.\n"
+        "Mean values inside each segment (DINO > 0.4 is strong; negative dNDVI = vegetation "
+        "loss; positive dNDBI = more built-up/bare):\n" + stats + "\n"
+        "For EACH region give one line:\n"
+        "  #<number>: <category> — <one-sentence description>\n"
+        "Category must be one of: building/construction, vegetation/agriculture, "
+        "road/infrastructure, water/flooding, bare soil/land-use, vehicle/object, "
+        "damage/disaster, no significant change, other.\n"
+        "Judge from BEFORE vs AFTER first; DINO and INDEX are supporting evidence only. "
+        "If before and after look the same, answer 'no significant change'.")
+
+
+def ask_ollama(prompt, image_bgr, args):
+    ok, buf = cv2.imencode(".jpg", image_bgr)
+    if not ok:
+        raise RuntimeError("Failed to encode montage")
+    r = requests.post(f"{args.ollama_url}/api/generate", timeout=args.ollama_timeout, json={
+        "model": args.model, "prompt": prompt, "stream": False, "think": False,
+        "images": [base64.b64encode(buf.tobytes()).decode()],
+        "keep_alive": args.ollama_keep_alive,
+        "options": {"num_predict": args.ollama_max_tokens},
+    })
+    r.raise_for_status()
+    body = r.json()
+    text = (body.get("response") or "").strip()
+    if not text:
+        hint = (" The model only produced 'thinking' -- use the non-thinking "
+                "`qwen3-vl:4b-instruct` tag or raise --ollama-max-tokens."
+                if body.get("thinking") else "")
+        raise RuntimeError(f"Ollama returned no text (done_reason={body.get('done_reason')}).{hint}")
+    return text
+
+
+def classify(regions, args):
+    """Save one montage per batch; ask the VLM unless --no-describe. Returns {number: text}."""
+    answers = {}
+    for start in range(0, len(regions), args.vlm_batch):
+        chunk, first = regions[start:start + args.vlm_batch], start + 1
+        montage = build_montage(chunk, first)
+        cv2.imwrite(os.path.join(args.out, f"montage_{first:02d}.png"), montage)
+        if args.no_describe:
+            continue
+        print(f"Asking {args.model} about regions #{first}-#{first + len(chunk) - 1}...")
+        try:
+            text = ask_ollama(make_prompt(chunk, first), montage, args)
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            print(f"VLM step failed ({e}). Montages and locations are still saved; "
+                  f"re-run to retry (scenes are cached).", file=sys.stderr)
+            break
+        for line in text.splitlines():
+            m = re.match(r"^\W*#?(\d+)\s*[:.)]\s*(.*)$", line.strip())
+            if m:
+                answers[int(m.group(1))] = m.group(2)
+    return answers
+
+
+# --------------------------------------------------------------------------- #
+# 5. Main
+# --------------------------------------------------------------------------- #
+def parse_args():
+    ap = argparse.ArgumentParser(description="STAC change detection with DINOv2 + SAM (+ NDVI/NDBI)")
+    g = ap.add_argument_group("scene (STAC)")
+    g.add_argument("--lat", type=float, default=35.2472)
+    g.add_argument("--lon", type=float, default=52.4921)
+    g.add_argument("--before", default="2020-01-01/2020-03-01", help="STAC datetime range")
+    g.add_argument("--after", default="2026-01-01/2026-03-01", help="STAC datetime range")
+    g.add_argument("--size-px", type=int, default=2048,
+                   help="Area size in 10 m pixels (2048 ~ 20 km). Cached on disk, so this can "
+                        "be big; memory use is set by --patch-px, not this.")
+    g.add_argument("--max-cloud", type=float, default=30, help="Max scene cloud cover %%")
+    g.add_argument("--cache-dir", default="stac_cache")
+    g.add_argument("--collection", default="sentinel-2-l2a")
+    g.add_argument("--stac-url", default="https://earth-search.aws.element84.com/v1")
+
+    g = ap.add_argument_group("patching (lower --patch-px if you run out of memory)")
+    g.add_argument("--patch-px", type=int, default=512)
+    g.add_argument("--overlap-px", type=int, default=64)
+
+    g = ap.add_argument_group("detection")
+    g.add_argument("--dino-model", default="dinov2_vits14")
+    g.add_argument("--dino-thresh", type=float, default=0.3,
+                   help="DINO cosine-distance threshold for candidate pixels")
+    g.add_argument("--index-thresh", type=float, default=0.2,
+                   help="|dNDVI| or |dNDBI| threshold for candidate pixels")
+    g.add_argument("--sam-checkpoint", default="sam_vit_b_01ec64.pth")
+    g.add_argument("--sam-model-type", default="vit_b", choices=["vit_b", "vit_l", "vit_h"])
+    g.add_argument("--sam-points", type=int, default=24, help="SAM grid density (lower = faster)")
+    g.add_argument("--min-score", type=float, default=0.25,
+                   help="Min mean fused score (0-1) for a SAM segment")
+    g.add_argument("--min-overlap", type=float, default=0.10,
+                   help="Min fraction of a SAM segment that must lie inside the candidate mask")
+    g.add_argument("--min-area", type=int, default=100, help="Min segment area in pixels")
+    g.add_argument("--per-patch", type=int, default=6, help="Max regions kept per patch")
+    g.add_argument("--max-regions", type=int, default=12, help="Max regions in the final report")
+
+    g = ap.add_argument_group("VLM (Ollama)")
+    g.add_argument("--model", default="qwen3-vl:4b-instruct")
+    g.add_argument("--ollama-url", default="http://localhost:11434")
+    g.add_argument("--ollama-timeout", type=int, default=900)
+    g.add_argument("--ollama-keep-alive", default="10m")
+    g.add_argument("--ollama-max-tokens", type=int, default=1024)
+    g.add_argument("--vlm-batch", type=int, default=4, help="Regions per VLM call")
+    g.add_argument("--no-describe", action="store_true")
+
+    ap.add_argument("--out", default="categorized_output")
+    return ap.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Category-agnostic change detection + VLM classification")
-    ap.add_argument("--before", help="Path to the 'before' image (omit if using --lat/--lon)")
-    ap.add_argument("--after", help="Path to the 'after' image (omit if using --lat/--lon)")
-
-    stac_group = ap.add_argument_group("STAC input (alternative to --before/--after)")
-    stac_group.add_argument("--lat", type=float, default=35.2472)
-    stac_group.add_argument("--lon", type=float, default=52.4921)
-    stac_group.add_argument("--before-start", default="2020-01-01")
-    stac_group.add_argument("--before-end", default="2020-03-01")
-    stac_group.add_argument("--after-start", default="2026-01-01")
-    stac_group.add_argument("--after-end", default="2026-03-01")
-    stac_group.add_argument("--buffer-km", type=float, default=None,
-                             help="Crop size around the point, in km. Overrides --target-px "
-                                  "if both are given.")
-    stac_group.add_argument("--target-px", type=int, default=1024,
-                             help="Crop size in pixels (converted to km using Sentinel-2's "
-                                  "~10m/pixel resolution). Defaults to 1024 — the same size "
-                                  "as LEVIR-CD's raw scenes (and a clean 4x4 grid of BIT_CD's "
-                                  "256px tiles). Ignored if --buffer-km is given.")
-    stac_group.add_argument("--cache-dir", default="stac_cache",
-                             help="Where fetched scenes are cached — repeat queries for the "
-                                  "same lat/lon/dates/area skip the network entirely")
-    stac_group.add_argument("--max-cloud", type=float, default=30,
-                             help="Max acceptable cloud cover %% when picking a scene")
-    stac_group.add_argument("--stac-collection", default="sentinel-2-l2a")
-    stac_group.add_argument("--stac-url", default="https://earth-search.aws.element84.com/v1")
-
-    ap.add_argument("--out", default="categorized_output")
-    ap.add_argument("--ssim-thresh", type=float, default=0.88,
-                     help="Lower = more sensitive to structural changes")
-    ap.add_argument("--color-thresh", type=float, default=18.0,
-                     help="Lab color distance threshold, lower = more sensitive to hue/color "
-                          "changes (e.g. vegetation turning brown)")
-    ap.add_argument("--min-area", type=int, default=100)
-    ap.add_argument("--max-regions", type=int, default=10,
-                     help="Cap on regions sent to the VLM per call")
-    ap.add_argument("--no-align", action="store_true")
-    ap.add_argument("--use-bit-cd", action="store_true",
-                     help="Also run BIT_CD and OR its building-change mask into region "
-                          "proposal (not just a label) — catches building changes the "
-                          "generic/index detectors miss, alongside everything else they find")
-    ap.add_argument("--bit-cd-repo", default=None)
-
-    dino_group = ap.add_argument_group("DINOv2 semantic change (zero-shot, no training needed)")
-    dino_group.add_argument("--use-dino", action="store_true",
-                             help="OR a DINOv2 patch-embedding change map into region proposal. "
-                                  "Unlike SSIM/color, this compares learned semantic content, so "
-                                  "it's less fooled by sensor calibration drift / seasonal color "
-                                  "shift between the before/after scene, and works at whatever "
-                                  "resolution Sentinel-2 gives you (no LEVIR-CD-style resolution "
-                                  "requirement like BIT_CD has).")
-    dino_group.add_argument("--dino-model", default="dinov2_vits14",
-                             help="torch.hub DINOv2 variant (vits14/vitb14/vitl14/vitg14 — "
-                                  "bigger = slower + slightly better features)")
-    dino_group.add_argument("--dino-thresh", type=float, default=0.3,
-                             help="Cosine-distance threshold (0-2 scale) for the DINO change "
-                                  "mask; lower = more sensitive")
-
-    sam_group = ap.add_argument_group("SAM region proposals (replaces contour/bbox proposal)")
-    sam_group.add_argument("--use-sam", default=True, action="store_true",
-                            help="Use Segment Anything to propose regions instead of contour "
-                                 "boxes from the OR'd masks — gives object-shaped regions scored "
-                                 "by mean change intensity (DINO if --use-dino is also set, else "
-                                 "the generic heatmap) rather than rectangles.")
-    sam_group.add_argument("--sam-checkpoint", default="sam_vit_b_01ec64.pth",
-                            help="Path to a SAM checkpoint (.pth) — required if --use-sam is set")
-    sam_group.add_argument("--sam-model-type", default="vit_b", choices=["vit_b", "vit_l", "vit_h"])
-    sam_group.add_argument("--sam-min-change-score", type=float, default=0.2,
-                            help="Minimum mean change score (DINO 0-2 scale if --use-dino, else "
-                                 "generic heatmap 0-1 scale) for a SAM segment to be kept")
-    sam_group.add_argument("--sam-points-per-side", type=int, default=24,
-                            help="SAM automatic-mask-generator grid density; lower = faster, "
-                                 "coarser segmentation")
-
-    ap.add_argument("--model", default="qwen3-vl:4b")
-    ap.add_argument("--ollama-url", default="http://localhost:11434")
-    ap.add_argument("--ollama-timeout", type=int, default=900,
-                     help="Seconds to wait for the Ollama response before giving up. Larger "
-                          "montages (more regions, --use-sam often proposes more than the "
-                          "contour fallback) take longer -- bump this if you see read timeouts, "
-                          "e.g. --ollama-timeout 600.")
-    ap.add_argument("--ollama-keep-alive", default="10m",
-                     help="How long Ollama keeps the model loaded after this request, so back-"
-                          "to-back runs don't pay model-load time again (Ollama's default is 5m).")
-    ap.add_argument("--no-describe", action="store_true")
-    args = ap.parse_args()
-
-    if args.use_sam and not args.sam_checkpoint:
-        ap.error("--use-sam requires --sam-checkpoint")
-
-    from bit_cd_infer import min_buffer_km_for_tiles, SENTINEL2_RES_M
-    stac_mode = args.lat is not None or args.lon is not None
-
-    if stac_mode and args.buffer_km is None:
-        args.buffer_km = round(args.target_px * SENTINEL2_RES_M / 1000, 2)
-        print(f"Using --target-px {args.target_px} -> --buffer-km {args.buffer_km} "
-              f"(Sentinel-2 ~{SENTINEL2_RES_M}m/pixel).")
-
-    if args.use_bit_cd and stac_mode:
-        min_km = min_buffer_km_for_tiles(BIT_CD_MIN_TILE_PX, n_tiles_per_side=1)
-        if args.buffer_km < min_km:
-            print(f"Note: --use-bit-cd needs at least a {BIT_CD_MIN_TILE_PX}x{BIT_CD_MIN_TILE_PX}px "
-                  f"crop to work properly (BIT_CD's training resolution) — at Sentinel-2's "
-                  f"~{SENTINEL2_RES_M}m/pixel, that means >= {min_km}km. Your "
-                  f"--buffer-km {args.buffer_km} would produce a "
-                  f"~{int(args.buffer_km*1000/SENTINEL2_RES_M)}x{int(args.buffer_km*1000/SENTINEL2_RES_M)}px "
-                  f"crop, which gets stretched with border-replicated padding and won't give BIT_CD "
-                  f"anything real to look at. Bumping --buffer-km to {min_km} for this run.")
-            args.buffer_km = min_km
-        else:
-            # Round UP to a clean multiple of the tile size so every tile —
-            # including the ones at the edge — is full real content, not
-            # just "big enough for one tile somewhere in the middle."
-            n_tiles = math.ceil(args.buffer_km / min_km)
-            rounded_km = round(n_tiles * min_km, 2)
-            if rounded_km != args.buffer_km:
-                print(f"Rounding --buffer-km {args.buffer_km} up to {rounded_km} "
-                      f"({n_tiles}x{n_tiles} clean {BIT_CD_MIN_TILE_PX}px tiles for BIT_CD, "
-                      f"no partial-padding edge tile).")
-                args.buffer_km = rounded_km
-
+    args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    ndvi_layer_full = None
-    ndbi_layer_full = None
-    index_mask = None
 
-    if args.lat is not None or args.lon is not None:
-        missing = [n for n, v in [
-            ("--lat", args.lat), ("--lon", args.lon),
-            ("--before-start", args.before_start), ("--before-end", args.before_end),
-            ("--after-start", args.after_start), ("--after-end", args.after_end),
-        ] if v is None]
-        if missing:
-            ap.error(f"--lat/--lon mode also needs: {', '.join(missing)}")
+    scene = Scene(fetch_pair(args))
+    print(f"Scene {scene.w}x{scene.h}px | before={scene.meta['before']['id']} "
+          f"after={scene.meta['after']['id']}")
 
-        from stac_fetch import fetch_before_after_with_indices
-        before, after, before_idx, after_idx, before_meta, after_meta = fetch_before_after_with_indices(
-            args.lat, args.lon, args.before_start, args.before_end,
-            args.after_start, args.after_end, buffer_km=args.buffer_km,
-            cache_dir=args.cache_dir, collection=args.stac_collection,
-            stac_url=args.stac_url, max_cloud=args.max_cloud,
-        )
-        print(f"Before scene: {before_meta['item_id']} ({before_meta['datetime']})")
-        print(f"After scene:  {after_meta['item_id']} ({after_meta['datetime']})")
-        cv2.imwrite(os.path.join(args.out, "before_source.png"), before)
-        cv2.imwrite(os.path.join(args.out, "after_source.png"), after)
+    print("Loading DINOv2 and SAM (once)...")
+    dino = dsc.load_dino(args.dino_model)  # (model, device, patch_size)
+    if dino[0] is None:
+        sys.exit("DINOv2 failed to load.")
+    sam = dsc.load_sam(args.sam_checkpoint, model_type=args.sam_model_type,
+                       points_per_side=args.sam_points, min_mask_region_area=args.min_area)
+    if sam is None:
+        sys.exit(f"SAM failed to load (checkpoint: {args.sam_checkpoint}).")
+    models = {"dino": dino, "sam": sam}
 
-        dndvi, dndbi, index_mask = compute_index_change_map(before_idx, after_idx)
-        ndvi_layer_full = _colorize_diverging_full(dndvi, pos_bgr=(0, 255, 0), neg_bgr=(0, 0, 255))
-        ndbi_layer_full = _colorize_single_sided_full(dndbi, bgr=(255, 0, 0))
-        cv2.imwrite(os.path.join(args.out, "ndvi_change.png"), ndvi_layer_full)
-        cv2.imwrite(os.path.join(args.out, "ndbi_change.png"), ndbi_layer_full)
+    step = max(args.patch_px - args.overlap_px, 1)
+    grid = list(itertools.product(_starts(scene.h, args.patch_px, step),
+                                  _starts(scene.w, args.patch_px, step)))
+    regions = []
+    for n, (y0, x0) in enumerate(grid, start=1):
+        found = detect_patch(scene, y0, x0, models, args)
+        print(f"[{n}/{len(grid)}] patch x={x0} y={y0}: {len(found)} region(s)")
+        regions += found
+        free_memory()
 
-        # STAC crops are already geo-aligned to the same lat/lon window/CRS —
-        # ECC alignment is unnecessary here and can misfire on seasonal
-        # vegetation texture changes, so it's skipped in this mode.
-        args.no_align = True
-    elif args.before and args.after:
-        before, after = load_and_align(args.before, args.after)
-        if args.use_bit_cd and min(before.shape[:2]) < BIT_CD_MIN_TILE_PX:
-            print(f"Warning: your image is {before.shape[1]}x{before.shape[0]}px — smaller than "
-                  f"the {BIT_CD_MIN_TILE_PX}x{BIT_CD_MIN_TILE_PX}px BIT_CD was trained on. It will "
-                  f"be padded with replicated edge pixels rather than resized, so BIT_CD is mostly "
-                  f"looking at stretched padding and likely won't find real changes here. Use a "
-                  f"larger source image, or crop/tile a bigger region, for --use-bit-cd to work well.")
-    else:
-        ap.error("Provide either --before/--after, or --lat/--lon + date ranges")
+    regions = merge_regions(regions, args.max_regions)
+    print(f"{len(regions)} region(s) after merging patches.")
 
-    if not args.no_align:
-        aligned, ok = align_images(before, after)
-        if ok:
-            after = aligned
-            print("Alignment: converged.")
-        else:
-            print("Alignment: did not converge, continuing unaligned.")
-
-    mask, raw_boxes, changed_pct = compute_generic_change_mask(
-        before, after, ssim_thresh=args.ssim_thresh, color_thresh=args.color_thresh,
-        min_area=args.min_area
-    )
-
-    bit_cd_mask = None
-    if args.use_bit_cd:
-        print("Running BIT_CD (building-change detector) as an additional detection source...")
-        bit_cd_mask = get_bit_cd_mask(before, after, args.bit_cd_repo)
-
-    # --- DINOv2 semantic change map (zero-shot, resolution-agnostic) ---
-    dino_map = None
-    dino_mask = None
-    dino_layer_full = None
-    if args.use_dino:
-        print(f"Running DINOv2 ({args.dino_model}) semantic change map...")
-        dino_model, dino_device, dino_patch_size = dsc.load_dino(args.dino_model)
-        if dino_model is not None:
-            dino_map = dsc.dino_change_map(before, after, dino_model, dino_device, dino_patch_size)
-            dino_mask = (dino_map > args.dino_thresh).astype(np.uint8) * 255
-            dino_layer_full = dsc.dino_heatmap_full(dino_map)
-            cv2.imwrite(os.path.join(args.out, "dino_change.png"), dino_layer_full)
-    else:
-        print("DINO disabled")
-    # OR every available detector's mask together for region proposal: generic
-    # SSIM/color (any visual change), spectral index (vegetation/built-up
-    # change invisible in RGB), BIT_CD (buildings, including ones the other
-    # two miss), and DINO (semantic change invisible to pixel-level diffs).
-    # A region only needs ONE detector to fire.
-    combined_mask = mask
-    if index_mask is not None:
-        combined_mask = cv2.bitwise_or(combined_mask, index_mask)
-    if bit_cd_mask is not None:
-        combined_mask = cv2.bitwise_or(combined_mask, bit_cd_mask)
-    if dino_mask is not None:
-        combined_mask = cv2.bitwise_or(combined_mask, dino_mask)
-
-    if index_mask is not None or bit_cd_mask is not None or dino_mask is not None:
-        mask = combined_mask
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        raw_boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= args.min_area]
-        changed_pct = 100.0 * np.count_nonzero(mask) / mask.size
-
-    generic_layer_full = compute_generic_heatmap_full(before, after)
-
-    # --- Region proposal: SAM segments (object-shaped) or legacy contour boxes ---
-    seg_masks = None
-    sam_scores = None
-    if args.use_sam:
-        print(f"Running SAM ({args.sam_model_type}) region proposal...")
-        mask_generator = dsc.load_sam(args.sam_checkpoint, model_type=args.sam_model_type,
-                                       points_per_side=args.sam_points_per_side,
-                                       min_mask_region_area=args.min_area)
-        if mask_generator is None:
-            print("Falling back to contour-based region proposal.", file=sys.stderr)
-            boxes = select_top_regions(merge_overlapping_boxes(raw_boxes), args.max_regions)
-        else:
-            if dino_map is not None:
-                score_map = dino_map
-                score_source = "dino"
-            else:
-                print("Note: --use-sam without --use-dino falls back to the generic heatmap "
-                      "(0-1 scale) for segment scoring — consider also passing --use-dino for "
-                      "a more reliable semantic score.")
-                score_map = compute_generic_change_score_full(before, after)
-                score_source = "generic"
-            sam_regions = dsc.sam_change_regions(
-                after, score_map, mask_generator,
-                min_change_score=args.sam_min_change_score,
-                min_area=args.min_area, max_regions=args.max_regions,
-            )
-            boxes = [r[0] for r in sam_regions]
-            seg_masks = [r[2] for r in sam_regions]
-            sam_scores = [r[1] for r in sam_regions]
-            print(f"SAM proposed {len(boxes)} region(s) above score {args.sam_min_change_score} "
-                  f"(scored via {score_source}).")
-    else:
-        boxes = merge_overlapping_boxes(raw_boxes)
-        boxes = select_top_regions(boxes, args.max_regions)
-
-    print(f"Changed area: {changed_pct:.2f}% | {len(raw_boxes)} raw regions -> "
-          f"{len(boxes)} after merge/cap")
-
-    source_labels = label_box_sources(boxes, bit_cd_mask=bit_cd_mask, index_mask=index_mask,
-                                       dino_mask=dino_mask, sam_scores=sam_scores)
-
-    region_geo = None
-    if stac_mode:
-        region_geo = [pixel_box_to_geo(b, before.shape, args.lat, args.lon, args.buffer_km)
-                      for b in boxes]
-        print("\n--- Region locations ---")
-        for i, g in enumerate(region_geo):
-            maps_url = f"https://www.google.com/maps?q={g['center_lat']:.6f},{g['center_lon']:.6f}"
-            print(f"#{i+1}: ({g['center_lat']:.5f}, {g['center_lon']:.5f})  {maps_url}")
-
-    overlay = draw_overlay(after, boxes, source_labels, seg_masks=seg_masks)
+    # Overlay of the whole scene (uint8, fine even for several thousand px per side).
+    overlay = scene.rgb("after", (slice(None), slice(None)))
+    for i, r in enumerate(regions, start=1):
+        cv2.drawContours(overlay, r.contours, -1, (0, 0, 255), 2)
+        cv2.putText(overlay, f"#{i}", (r.box[0], max(14, r.box[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     cv2.imwrite(os.path.join(args.out, "overlay.png"), overlay)
-    cv2.imwrite(os.path.join(args.out, "mask.png"), mask)
     print(f"Saved overlay -> {os.path.join(args.out, 'overlay.png')}")
 
-    if not boxes:
-        print("No candidate regions found.")
+    if not regions:
+        print("No candidate regions found. Try lowering --dino-thresh / --min-score.")
         return
 
-    bit_cd_layer_full = cv2.cvtColor(bit_cd_mask, cv2.COLOR_GRAY2BGR) if bit_cd_mask is not None else None
-    layers = {
-        "bit_cd": bit_cd_layer_full,
-        "ndvi": ndvi_layer_full,
-        "ndbi": ndbi_layer_full,
-        "dino": dino_layer_full,
-        "generic": generic_layer_full,
-        "sam_overlay_enabled": args.use_sam and seg_masks is not None,
-    }
-    available_signals = {name for name in ("bit_cd", "ndvi", "ndbi", "dino")
-                          if layers.get(name) is not None}
-    if layers["sam_overlay_enabled"]:
-        available_signals.add("sam_overlay")
+    answers = classify(regions, args)
 
-    montage = build_montage(before, after, boxes, layers=layers, seg_masks=seg_masks)
-    cv2.imwrite(os.path.join(args.out, "montage.png"), montage)
-
-    if args.no_describe:
-        return
-
-    print(f"Asking {args.model} to classify + describe {len(boxes)} region(s)...")
-    try:
-        result = classify_and_describe(
-            montage, len(boxes), source_labels=source_labels, model=args.model,
-            ollama_url=args.ollama_url, available_signals=available_signals,
-            timeout=args.ollama_timeout, keep_alive=args.ollama_keep_alive,
-        )
-        result = merge_location_into_result(result, boxes, region_geo)
-        print("\n--- Per-region classification ---")
-        print(result)
-        with open(os.path.join(args.out, "regions.txt"), "w") as f:
-            f.write(result)
-    except requests.exceptions.Timeout:
-        print(f"\nOllama request timed out after {args.ollama_timeout}s. The model may still be "
-              f"generating -- try again with a larger --ollama-timeout, or check `ollama ps` to "
-              f"see if {args.model} is still loaded/running.", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.RequestException as e:
-        print(f"\nCould not reach Ollama at {args.ollama_url}: {e}", file=sys.stderr)
-        sys.exit(1)
+    lines = []
+    for i, r in enumerate(regions, start=1):
+        x, y, w, h = r.box
+        lat, lon = scene.latlon(x + w / 2, y + h / 2)
+        line = (f"#{i} @ ({lat:.5f}, {lon:.5f}) [https://www.google.com/maps?q={lat:.6f},{lon:.6f}] "
+                f"score={r.score:.2f} DINO={r.stats['dino']:.2f} "
+                f"dNDVI={r.stats['dndvi']:+.2f} dNDBI={r.stats['dndbi']:+.2f}")
+        if i in answers:
+            line += f" | {answers[i]}"
+        lines.append(line)
+    result = "\n".join(lines)
+    print("\n--- Regions ---")
+    print(result)
+    with open(os.path.join(args.out, "regions.txt"), "w") as f:
+        f.write(result + "\n")
 
 
 if __name__ == "__main__":
