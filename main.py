@@ -212,12 +212,18 @@ def evidence_row(before, after, heat, idx_rgb, box, seg, pad=0.3):
     seg_t = cv2.resize(seg[y1:y2, x1:x2].astype(np.uint8), (TILE, TILE),
                        interpolation=cv2.INTER_NEAREST)
     cnts, _ = cv2.findContours(seg_t, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # exact pixel the reported lat/lon refers to (box center), marked on AFTER so you can
+    # check directly whether the reported coordinate sits on the object you expect
+    cx = int((x + w / 2 - x1) / max(x2 - x1, 1) * TILE)
+    cy = int((y + h / 2 - y1) / max(y2 - y1, 1) * TILE)
     panels = []
     for img, outline in ((before, True), (after, True), (heat, False), (idx_rgb, False)):
         p = cv2.resize(img[y1:y2, x1:x2], (TILE, TILE), interpolation=cv2.INTER_LINEAR)
         if outline:
             cv2.drawContours(p, cnts, -1, (0, 255, 255), 1)
         panels.append(p)
+    marker = panels[1]
+    cv2.drawMarker(marker, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
     return np.hstack(panels)
 
 
@@ -383,10 +389,28 @@ def classify(regions):
     return answers
 
 
+def sanity_check(scene):
+    corners = {"top-left": (0, 0), "top-right": (scene.w, 0),
+               "bottom-left": (0, scene.h), "bottom-right": (scene.w, scene.h)}
+    print("Scene corners (check these fall where you expect on a map):")
+    for name, (c, r) in corners.items():
+        lat, lon = scene.latlon(c, r)
+        print(f"  {name:12s}: {lat:.5f}, {lon:.5f}  https://www.google.com/maps?q={lat:.6f},{lon:.6f}")
+    if CENTER is not None:
+        lat, lon = scene.latlon(scene.w / 2, scene.h / 2)
+        d = ((lat - CENTER[0]) * 111_320) ** 2 + ((lon - CENTER[1]) * 111_320 * np.cos(np.radians(lat))) ** 2
+        print(f"CENTER round-trip: requested {CENTER}, window center is {lat:.5f}, {lon:.5f} "
+              f"({d ** 0.5:.0f}m away, should be near 0)")
+    else:
+        print("CENTER is None: the window is centered on the raster, not on a place you chose. "
+              "Set CENTER = (lat, lon) to look at a specific location.")
+
+
 def main():
     os.makedirs(os.path.join(OUT_DIR, "debug"), exist_ok=True)
 
     scene = load_scene()
+    sanity_check(scene)
 
     print("Loading DINOv2 and SAM...")
     dino = dsc.load_dino(DINO_MODEL)
