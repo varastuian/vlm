@@ -11,3 +11,4 @@ bit_cd_output/
 stac_cache
 categorized_output
 *.pth
+raw

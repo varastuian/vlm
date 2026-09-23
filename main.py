@@ -444,7 +444,48 @@ def main():
     if not regions:
         print("No regions. Check the debug sheets or lower DINO_THRESH / MIN_SCORE.")
         return
+    # --- export to geojson for the viewer -------------------------
+    from rasterio.transform import Affine
+    from rasterio.warp import transform as warp_transform
 
+    def polygon_to_lonlat(poly_px):
+        t = Affine(*scene.meta["transform"])
+        xs, ys = zip(*poly_px)
+        gx = [ (t * (x, y))[0] for x, y in poly_px ]
+        gy = [ (t * (x, y))[1] for x, y in poly_px ]
+        lons, lats = warp_transform(scene.meta["crs"], "EPSG:4326", gx, gy)
+        return [[float(lon), float(lat)] for lon, lat in zip(lons, lats)]
+
+    features = []
+    for i, r in enumerate(regions, start=1):
+        for c in r["contours"]:
+            ring_px = c.reshape(-1, 2).tolist()
+            if len(ring_px) < 3:
+                continue
+            ring = polygon_to_lonlat(ring_px)
+            if ring[0] != ring[-1]:
+                ring.append(ring[0])
+            x, y, w, h = r["box"]
+            ll = scene.latlon(x + w / 2, y + h / 2)
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": {
+                    "tile": scene.meta["before"]["id"].split("_")[1],
+                    "index": i,
+                    "score": round(r["score"], 3),
+                    "dino": round(r["dino"], 3),
+                    "dndvi": round(r["dndvi"], 3),
+                    "dndbi": round(r["dndbi"], 3),
+                    "lon": ll[1] if ll else None,
+                    "lat": ll[0] if ll else None,
+                },
+            })
+
+    import json
+    with open("categorized_output/regions.geojson", "w") as f:
+        json.dump({"type": "FeatureCollection", "features": features}, f, indent=2)
+    print(f"Wrote {len(features)} change polygon(s) to categorized_output/regions.geojson")
     answers = classify(regions)
 
     lines = []
