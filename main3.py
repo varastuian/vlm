@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.transform import xy
 from rasterio.warp import reproject
 
 from skimage import measure, morphology
@@ -48,9 +49,10 @@ MAX_CANDIDATES = 100
 
 # ---------------- Fusion ----------------
 
-W_DINO = 0.60
+W_DINO = 0.50
 W_NDBI = 0.25
 W_NDVI = 0.15
+W_NDMI = 0.10
 
 
 # ============================================================
@@ -114,6 +116,71 @@ def read_rgb(path):
         )
 
     return arr, profile, transform, crs
+
+
+def read_rgb_to_reference(path, reference_path):
+
+    """Read an RGB raster on exactly the reference raster grid."""
+
+    with rasterio.open(reference_path) as ref:
+
+        ref_height = ref.height
+        ref_width = ref.width
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_profile = ref.profile.copy()
+
+    with rasterio.open(path) as src:
+
+        if src.count != 3:
+            raise ValueError(f"Expected RGB image with 3 bands: {path}")
+
+        same_grid = (
+            src.height == ref_height
+            and src.width == ref_width
+            and src.transform == ref_transform
+            and src.crs == ref_crs
+        )
+
+        if same_grid:
+            return (
+                src.read(),
+                ref_profile,
+                ref_transform,
+                ref_crs
+            )
+
+        destination = np.full(
+            (3, ref_height, ref_width),
+            np.nan,
+            dtype=np.float32
+        )
+
+        for band_index in range(3):
+
+            reproject(
+                source=rasterio.band(src, band_index + 1),
+                destination=destination[band_index],
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=ref_transform,
+                dst_crs=ref_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=src.nodata,
+                dst_nodata=np.nan
+            )
+
+    print(
+        f"Aligned RGB: {path.name} -> "
+        f"{reference_path.name} grid"
+    )
+
+    return (
+        destination,
+        ref_profile,
+        ref_transform,
+        ref_crs
+    )
 
 
 def save_float_tif(path, array, reference_profile):
@@ -184,6 +251,62 @@ def robust_abs_change(x):
     )
 
 
+def normalize_rgb_pair(before, after):
+
+    """Normalize both RGB dates with shared per-band limits."""
+
+    before = before.astype(np.float32)
+    after = after.astype(np.float32)
+
+    if before.shape[0] != 3 or after.shape[0] != 3:
+        raise ValueError("RGB rasters must contain exactly three bands.")
+
+    before_out = np.zeros_like(before, dtype=np.float32)
+    after_out = np.zeros_like(after, dtype=np.float32)
+
+    for band_index in range(3):
+
+        values = np.concatenate([
+            before[band_index].ravel(),
+            after[band_index].ravel()
+        ])
+        valid = np.isfinite(values)
+
+        if not np.any(valid):
+            continue
+
+        lo, hi = np.percentile(values[valid], [2, 98])
+
+        if hi <= lo:
+            continue
+
+        before_out[band_index] = np.clip(
+            (before[band_index] - lo) / (hi - lo),
+            0.0,
+            1.0
+        )
+        after_out[band_index] = np.clip(
+            (after[band_index] - lo) / (hi - lo),
+            0.0,
+            1.0
+        )
+
+    before_out = np.nan_to_num(
+        before_out,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+    after_out = np.nan_to_num(
+        after_out,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    return before_out, after_out
+
+
 # ============================================================
 # RESAMPLE BAND TO REFERENCE GRID
 # ============================================================
@@ -222,8 +345,9 @@ def read_band_to_reference(path, reference_path):
 
         source = src.read(1).astype(np.float32)
 
-        destination = np.empty(
+        destination = np.full(
             (dst_height, dst_width),
+            np.nan,
             dtype=np.float32
         )
 
@@ -320,7 +444,7 @@ rgb_before, ref_profile, ref_transform, ref_crs = \
     read_rgb(RGB_BEFORE)
 
 rgb_after, profile_after, transform_after, crs_after = \
-    read_rgb(RGB_AFTER)
+    read_rgb_to_reference(RGB_AFTER, RGB_BEFORE)
 
 
 if rgb_before.shape != rgb_after.shape:
@@ -333,8 +457,13 @@ if rgb_before.shape != rgb_after.shape:
 
 print("\nNormalizing RGB images...")
 
-rgb_before = normalize_rgb_image(rgb_before)
-rgb_after = normalize_rgb_image(rgb_after)
+rgb_valid_before = np.all(np.isfinite(rgb_before), axis=0)
+rgb_valid_after = np.all(np.isfinite(rgb_after), axis=0)
+
+rgb_before, rgb_after = normalize_rgb_pair(
+    rgb_before,
+    rgb_after
+)
 print(
     "Normalized BEFORE:",
     rgb_before.dtype,
@@ -350,20 +479,6 @@ print(
     rgb_after.max(),
     np.percentile(rgb_after, [1, 50, 99])
 )
-if transform_after != ref_transform:
-
-    raise ValueError(
-        "Before/after transforms are different."
-    )
-
-
-if crs_after != ref_crs:
-
-    raise ValueError(
-        "Before/after CRS are different."
-    )
-
-
 H = rgb_before.shape[1]
 W = rgb_before.shape[2]
 
@@ -451,36 +566,17 @@ def make_patch(rgb, y, x, size):
     )
 
     if patch.dtype != np.uint8:
-
-        lo = np.percentile(
-            patch,
-            2
+        patch = np.nan_to_num(
+            patch.astype(np.float32),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0
         )
-
-        hi = np.percentile(
-            patch,
-            98
-        )
-
-        if hi > lo:
-
-            patch = (
-                patch.astype(np.float32)
-                - lo
-            ) / (hi - lo)
-
-            patch = np.clip(
-                patch * 255.0,
-                0,
-                255
-            ).astype(np.uint8)
-
-        else:
-
-            patch = np.zeros_like(
-                patch,
-                dtype=np.uint8
-            )
+        return np.clip(
+            patch * 255.0,
+            0,
+            255
+        ).astype(np.uint8)
 
     return patch
 
@@ -566,6 +662,12 @@ def dino_batch_features(images):
 # ============================================================
 
 print("\nRunning bitemporal DINO...")
+
+if H < DINO_INPUT_SIZE or W < DINO_INPUT_SIZE:
+    raise ValueError(
+        f"RGB raster ({W} x {H}) is smaller than the "
+        f"DINO patch size ({DINO_INPUT_SIZE})."
+    )
 
 ys = list(
     range(
@@ -813,8 +915,8 @@ save_float_tif(
 print("\nLoading spectral bands...")
 
 print(
-    "\nImportant: SWIR is normally 20 m, "
-    "so it will be resampled to the NIR 10 m grid."
+    "\nImportant: all spectral bands are resampled to the "
+    "before-image 10 m reference grid."
 )
 
 
@@ -825,14 +927,14 @@ print(
 red_b = normalize_reflectance(
     read_band_to_reference(
         RED_BEFORE,
-        NIR_BEFORE
+        RGB_BEFORE
     )
 )
 
 red_a = normalize_reflectance(
     read_band_to_reference(
         RED_AFTER,
-        NIR_AFTER
+        RGB_BEFORE
     )
 )
 
@@ -844,14 +946,14 @@ red_a = normalize_reflectance(
 nir_b = normalize_reflectance(
     read_band_to_reference(
         NIR_BEFORE,
-        NIR_BEFORE
+        RGB_BEFORE
     )
 )
 
 nir_a = normalize_reflectance(
     read_band_to_reference(
         NIR_AFTER,
-        NIR_AFTER
+        RGB_BEFORE
     )
 )
 
@@ -863,14 +965,14 @@ nir_a = normalize_reflectance(
 swir_b = normalize_reflectance(
     read_band_to_reference(
         SWIR_BEFORE,
-        NIR_BEFORE
+        RGB_BEFORE
     )
 )
 
 swir_a = normalize_reflectance(
     read_band_to_reference(
         SWIR_AFTER,
-        NIR_AFTER
+        RGB_BEFORE
     )
 )
 
@@ -903,6 +1005,23 @@ for name, arr in [
             f"{arr.shape} != "
             f"{expected_shape}"
         )
+
+
+valid_mask = (
+    rgb_valid_before
+    & rgb_valid_after
+    & np.isfinite(red_b)
+    & np.isfinite(red_a)
+    & np.isfinite(nir_b)
+    & np.isfinite(nir_a)
+    & np.isfinite(swir_b)
+    & np.isfinite(swir_a)
+    & ((np.abs(red_b) + np.abs(nir_b) + np.abs(swir_b)) > 0)
+    & ((np.abs(red_a) + np.abs(nir_a) + np.abs(swir_a)) > 0)
+)
+
+if not np.any(valid_mask):
+    raise RuntimeError("No valid overlapping pixels were found.")
 
 
 # ============================================================
@@ -1014,6 +1133,8 @@ fused = (
     W_NDBI * delta_ndbi
     +
     W_NDVI * delta_ndvi
+    +
+    W_NDMI * delta_ndmi
 )
 
 
@@ -1024,11 +1145,20 @@ fused = np.nan_to_num(
     neginf=0.0
 )
 
+fused[~valid_mask] = np.nan
+
 
 fused = percentile_normalize(
     fused,
     2,
     98
+)
+
+fused = np.nan_to_num(
+    fused,
+    nan=0.0,
+    posinf=0.0,
+    neginf=0.0
 )
 
 
@@ -1046,12 +1176,15 @@ save_float_tif(
 print("\nExtracting candidate change regions...")
 
 
-threshold = np.percentile(
-    fused[
-        np.isfinite(fused)
-    ],
-    CHANGE_PERCENTILE
-)
+valid_scores = fused[valid_mask]
+
+if np.max(valid_scores) <= 0:
+    threshold = np.inf
+else:
+    threshold = np.percentile(
+        valid_scores,
+        CHANGE_PERCENTILE
+    )
 
 
 print(
@@ -1062,6 +1195,7 @@ print(
 
 
 mask = fused >= threshold
+mask &= valid_mask
 
 
 # Remove tiny isolated regions.
@@ -1141,6 +1275,11 @@ csv_path = (
     "candidate_regions.csv"
 )
 
+pixel_area_m2 = abs(
+    ref_transform.a * ref_transform.e
+    - ref_transform.b * ref_transform.d
+)
+
 
 with open(
     csv_path,
@@ -1160,6 +1299,9 @@ with open(
         "max_col",
         "centroid_row",
         "centroid_col",
+        "area_m2",
+        "centroid_x",
+        "centroid_y",
         "mean_change",
         "max_change"
     ])
@@ -1176,6 +1318,12 @@ with open(
             region.image
         ]
 
+        centroid_y, centroid_x = xy(
+            ref_transform,
+            region.centroid[0],
+            region.centroid[1]
+        )
+
         writer.writerow([
             idx + 1,
             region.area,
@@ -1185,6 +1333,9 @@ with open(
             maxc,
             region.centroid[0],
             region.centroid[1],
+            region.area * pixel_area_m2,
+            centroid_x,
+            centroid_y,
             float(np.mean(values)),
             float(np.max(values))
         ])
