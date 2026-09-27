@@ -12,3 +12,4 @@ stac_cache
 categorized_output
 *.pth
 raw
+viz_out
