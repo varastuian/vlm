@@ -7,6 +7,8 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import xy
+from rasterio.windows import Window
+from rasterio.windows import transform as window_transform
 from rasterio.warp import reproject
 
 from skimage import measure, morphology
@@ -253,7 +255,7 @@ def robust_abs_change(x):
 
 def normalize_rgb_pair(before, after):
 
-    """Normalize both RGB dates with shared per-band limits."""
+    """Create temporary DINO inputs; source RGB arrays stay untouched."""
 
     before = before.astype(np.float32)
     after = after.astype(np.float32)
@@ -443,42 +445,63 @@ print("\nLoading RGB...")
 rgb_before, ref_profile, ref_transform, ref_crs = \
     read_rgb(RGB_BEFORE)
 
-rgb_after, profile_after, transform_after, crs_after = \
+rgb_after_raw, profile_after_raw, transform_after_raw, crs_after_raw = \
+    read_rgb(RGB_AFTER)
+
+rgb_after_aligned, profile_after, transform_after, crs_after = \
     read_rgb_to_reference(RGB_AFTER, RGB_BEFORE)
 
 
-if rgb_before.shape != rgb_after.shape:
+if rgb_before.shape != rgb_after_aligned.shape:
 
     raise ValueError(
         "Before/after RGB dimensions differ:\n"
         f"Before: {rgb_before.shape}\n"
-        f"After : {rgb_after.shape}"
+        f"After : {rgb_after_aligned.shape}"
     )
 
-print("\nNormalizing RGB images...")
+same_after_grid = (
+    rgb_after_raw.shape == rgb_before.shape
+    and transform_after_raw == ref_transform
+    and crs_after_raw == ref_crs
+)
 
 rgb_valid_before = np.all(np.isfinite(rgb_before), axis=0)
-rgb_valid_after = np.all(np.isfinite(rgb_after), axis=0)
+rgb_valid_after = np.all(np.isfinite(rgb_after_aligned), axis=0)
 
-rgb_before, rgb_after = normalize_rgb_pair(
+print("\nPreparing temporary DINO inputs...")
+
+dino_rgb_before, dino_rgb_after = normalize_rgb_pair(
     rgb_before,
-    rgb_after
+    rgb_after_aligned
 )
 print(
-    "Normalized BEFORE:",
-    rgb_before.dtype,
-    rgb_before.min(),
-    rgb_before.max(),
-    np.percentile(rgb_before, [1, 50, 99])
+    "DINO BEFORE:",
+    dino_rgb_before.dtype,
+    dino_rgb_before.min(),
+    dino_rgb_before.max()
 )
 
 print(
-    "Normalized AFTER:",
-    rgb_after.dtype,
-    rgb_after.min(),
-    rgb_after.max(),
-    np.percentile(rgb_after, [1, 50, 99])
+    "DINO AFTER:",
+    dino_rgb_after.dtype,
+    dino_rgb_after.min(),
+    dino_rgb_after.max()
 )
+
+if same_after_grid:
+    rgb_after_output = rgb_after_raw
+    profile_after_output = profile_after_raw
+    transform_after_output = transform_after_raw
+else:
+    print(
+        "Warning: AFTER RGB crop output uses the aligned grid because "
+        "the source grids differ."
+    )
+    rgb_after_output = rgb_after_aligned
+    profile_after_output = ref_profile
+    transform_after_output = ref_transform
+
 H = rgb_before.shape[1]
 W = rgb_before.shape[2]
 
@@ -746,7 +769,7 @@ for start in range(
 
     before_batch = [
         make_patch(
-            rgb_before,
+            dino_rgb_before,
             y,
             x,
             DINO_INPUT_SIZE
@@ -761,7 +784,7 @@ for start in range(
 
     after_batch = [
         make_patch(
-            rgb_after,
+            dino_rgb_after,
             y,
             x,
             DINO_INPUT_SIZE
@@ -1368,48 +1391,40 @@ crop_dir.mkdir(
 )
 
 
-def rgb_to_uint8(arr):
+def save_raw_rgb_crop(
+    path,
+    rgb,
+    x1,
+    y1,
+    x2,
+    y2,
+    reference_profile,
+    reference_transform
+):
 
-    arr = np.transpose(
-        arr,
-        (1, 2, 0)
+    """Save a crop without changing its values or dtype."""
+
+    crop = rgb[:, y1:y2, x1:x2]
+    profile = reference_profile.copy()
+
+    profile.pop("blockxsize", None)
+    profile.pop("blockysize", None)
+    profile.pop("tiled", None)
+
+    profile.update(
+        driver="GTiff",
+        height=crop.shape[1],
+        width=crop.shape[2],
+        count=3,
+        dtype=str(crop.dtype),
+        transform=window_transform(
+            Window(x1, y1, x2 - x1, y2 - y1),
+            reference_transform
+        )
     )
 
-    if arr.dtype != np.uint8:
-
-        lo = np.percentile(
-            arr,
-            2
-        )
-
-        hi = np.percentile(
-            arr,
-            98
-        )
-
-        if hi > lo:
-
-            arr = (
-                (
-                    arr.astype(
-                        np.float32
-                    )
-                    -
-                    lo
-                )
-                /
-                (hi - lo)
-                *
-                255.0
-            )
-
-        arr = np.clip(
-            arr,
-            0,
-            255
-        ).astype(np.uint8)
-
-    return arr
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(crop)
 
 
 for idx, region in enumerate(
@@ -1455,7 +1470,7 @@ for idx, region in enumerate(
 
 
     after_crop = \
-        rgb_after[
+        rgb_after_output[
             :,
             y1:y2,
             x1:x2
@@ -1469,25 +1484,29 @@ for idx, region in enumerate(
         ]
 
 
-    Image.fromarray(
-        rgb_to_uint8(
-            before_crop
-        )
-    ).save(
+    save_raw_rgb_crop(
         crop_dir /
-        f"{idx+1:03d}_before.jpg",
-        quality=95
+        f"{idx+1:03d}_before.tif",
+        before_crop,
+        x1,
+        y1,
+        x2,
+        y2,
+        ref_profile,
+        ref_transform
     )
 
 
-    Image.fromarray(
-        rgb_to_uint8(
-            after_crop
-        )
-    ).save(
+    save_raw_rgb_crop(
         crop_dir /
-        f"{idx+1:03d}_after.jpg",
-        quality=95
+        f"{idx+1:03d}_after.tif",
+        after_crop,
+        x1,
+        y1,
+        x2,
+        y2,
+        profile_after_output,
+        transform_after_output
     )
 
 
