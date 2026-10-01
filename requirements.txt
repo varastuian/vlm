@@ -1,9 +1,28 @@
-torch
-torchvision
-einops
-opencv-python-headless
-numpy
-requests
-scikit-image
-pystac-client
-rasterio
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python-headless>=4.7.0
+rasterio>=1.3.0
+sentinelhub>=3.9.0
+albumentations>=1.3.0
+fastapi>=0.95.0
+uvicorn>=0.22.0
+scikit-image>=0.20.0
+matplotlib>=3.7.0
+shapely>=2.0.0
+geopandas>=0.13.0
+pyproj>=3.5.0
+pydantic>=1.10.0
+python-multipart>=0.0.6
+requests>=2.28.0
+tqdm>=4.65.0
+streamlit==1.49.1
+streamlit-drawable-canvas==0.9.3
+# fused pipeline (pipeline_fused.py) — optional extras
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+pystac-client>=0.7.0
+
+# added for change_core.py / frontend.py
+scipy>=1.10.0
+pandas>=2.0.0
+pillow>=10.0.0

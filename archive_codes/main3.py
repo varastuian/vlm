@@ -25,7 +25,7 @@ from torchvision import transforms
 
 ROOT = Path(".")
 RAW = ROOT / "raw"
-OUT = ROOT / "phase456_output"
+OUT = ROOT / "phase456_output_png"
 
 OUT.mkdir(exist_ok=True)
 
@@ -48,6 +48,11 @@ DINO_BATCH_SIZE = 8
 CHANGE_PERCENTILE = 97.0
 MIN_OBJECT_PIXELS = 25
 MAX_CANDIDATES = 100
+
+# ---------------- Area of interest ----------------
+# Bottom-center quarter of the source scene by default.
+AOI_WIDTH_FRACTION = 0.25
+AOI_HEIGHT_FRACTION = 0.25
 
 # ---------------- Fusion ----------------
 
@@ -185,41 +190,52 @@ def read_rgb_to_reference(path, reference_path):
     )
 
 
-def save_float_tif(path, array, reference_profile):
+def save_change_png(path, array):
 
-    profile = reference_profile.copy()
+    """Save a change score as a grayscale PNG for visual inspection."""
 
-    profile.update(
-        driver="GTiff",
-        dtype="float32",
-        count=1,
-        compress="deflate",
-        predictor=2,
-        nodata=None
+    image = (
+        percentile_normalize(array, 2, 98) * 255.0
+    ).astype(np.uint8)
+
+    save_png_image(
+        Image.fromarray(image, mode="L"),
+        path
     )
+    print(f"Saved: {path}")
 
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(array.astype(np.float32), 1)
+
+def save_mask_png(path, array):
+
+    save_png_image(
+        Image.fromarray(
+            np.asarray(array, dtype=np.uint8),
+            mode="L"
+        ),
+        path
+    )
 
     print(f"Saved: {path}")
 
 
-def save_uint8_tif(path, array, reference_profile):
+def save_png_image(image, path):
 
-    profile = reference_profile.copy()
+    """Write PNG explicitly and retry with a safe alternate filename."""
 
-    profile.update(
-        driver="GTiff",
-        dtype="uint8",
-        count=1,
-        compress="deflate",
-        nodata=0
-    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(array.astype(np.uint8), 1)
-
-    print(f"Saved: {path}")
+    try:
+        image.save(str(path), format="PNG")
+    except OSError as error:
+        retry_path = path.with_name(
+            f"{path.stem}_retry{path.suffix}"
+        )
+        print(
+            f"PNG write failed for {path}: {error}. "
+            f"Retrying as {retry_path}."
+        )
+        image.save(str(retry_path), format="PNG")
 
 
 def percentile_normalize(x, low=2, high=98):
@@ -309,11 +325,58 @@ def normalize_rgb_pair(before, after):
     return before_out, after_out
 
 
+def choose_png_rgb_scale(*arrays):
+
+    """Choose one fixed display scale for the complete image pair."""
+
+    values = np.concatenate([
+        np.asarray(array, dtype=np.float32).ravel()
+        for array in arrays
+    ])
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        return 1.0
+
+    p99 = np.percentile(values, 99)
+
+    if p99 <= 1.0:
+        return 1.0
+    if p99 <= 255.0:
+        return 255.0
+    if p99 <= 10000.0:
+        return 10000.0
+    return 65535.0
+
+
+def rgb_to_png(rgb, scale):
+
+    """Convert RGB to 8-bit PNG using a fixed, non-local scale."""
+
+    image = np.transpose(
+        rgb,
+        (1, 2, 0)
+    ).astype(np.float32)
+
+    image = np.nan_to_num(
+        image,
+        nan=0.0,
+        posinf=scale,
+        neginf=0.0
+    )
+
+    return np.clip(
+        image / scale * 255.0,
+        0.0,
+        255.0
+    ).round().astype(np.uint8)
+
+
 # ============================================================
 # RESAMPLE BAND TO REFERENCE GRID
 # ============================================================
 
-def read_band_to_reference(path, reference_path):
+def read_band_to_reference(path, reference_path, window=None):
 
     """
     Reads a single band and resamples it to exactly match
@@ -337,10 +400,18 @@ def read_band_to_reference(path, reference_path):
 
     with rasterio.open(reference_path) as ref:
 
-        dst_height = ref.height
-        dst_width = ref.width
+        if window is None:
+            dst_height = ref.height
+            dst_width = ref.width
+            dst_transform = ref.transform
+        else:
+            dst_height = int(window.height)
+            dst_width = int(window.width)
+            dst_transform = window_transform(
+                window,
+                ref.transform
+            )
 
-        dst_transform = ref.transform
         dst_crs = ref.crs
 
     with rasterio.open(path) as src:
@@ -466,6 +537,52 @@ same_after_grid = (
     and crs_after_raw == ref_crs
 )
 
+full_height = rgb_before.shape[1]
+full_width = rgb_before.shape[2]
+
+aoi_width = max(
+    1,
+    int(round(full_width * AOI_WIDTH_FRACTION))
+)
+aoi_height = max(
+    1,
+    int(round(full_height * AOI_HEIGHT_FRACTION))
+)
+
+aoi_x1 = (full_width - aoi_width) // 2
+aoi_y1 = full_height - aoi_height
+aoi_x2 = aoi_x1 + aoi_width
+aoi_y2 = aoi_y1 + aoi_height
+
+print(
+    "\nUsing bottom-center AOI: "
+    f"x={aoi_x1}:{aoi_x2}, "
+    f"y={aoi_y1}:{aoi_y2} "
+    f"({aoi_width} x {aoi_height} pixels)"
+)
+
+rgb_before = rgb_before[:, aoi_y1:aoi_y2, aoi_x1:aoi_x2]
+rgb_after_aligned = rgb_after_aligned[
+    :, aoi_y1:aoi_y2, aoi_x1:aoi_x2
+]
+
+if same_after_grid:
+    rgb_after_raw = rgb_after_raw[
+        :, aoi_y1:aoi_y2, aoi_x1:aoi_x2
+    ]
+
+ref_transform = window_transform(
+    Window(aoi_x1, aoi_y1, aoi_width, aoi_height),
+    ref_transform
+)
+
+aoi_window = Window(
+    aoi_x1,
+    aoi_y1,
+    aoi_width,
+    aoi_height
+)
+
 rgb_valid_before = np.all(np.isfinite(rgb_before), axis=0)
 rgb_valid_after = np.all(np.isfinite(rgb_after_aligned), axis=0)
 
@@ -491,16 +608,22 @@ print(
 
 if same_after_grid:
     rgb_after_output = rgb_after_raw
-    profile_after_output = profile_after_raw
-    transform_after_output = transform_after_raw
 else:
     print(
         "Warning: AFTER RGB crop output uses the aligned grid because "
         "the source grids differ."
     )
     rgb_after_output = rgb_after_aligned
-    profile_after_output = ref_profile
-    transform_after_output = ref_transform
+
+png_rgb_scale = choose_png_rgb_scale(
+    rgb_before,
+    rgb_after_output
+)
+
+print(
+    f"PNG RGB scale: 0-{png_rgb_scale:g} -> 0-255 "
+    "(fixed for all crops)"
+)
 
 H = rgb_before.shape[1]
 W = rgb_before.shape[2]
@@ -924,10 +1047,9 @@ dino_change = percentile_normalize(
 )
 
 
-save_float_tif(
-    OUT / "01_dino_change.tif",
-    dino_change,
-    ref_profile
+save_change_png(
+    OUT / "01_dino_change.png",
+    dino_change
 )
 
 
@@ -950,14 +1072,16 @@ print(
 red_b = normalize_reflectance(
     read_band_to_reference(
         RED_BEFORE,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
 red_a = normalize_reflectance(
     read_band_to_reference(
         RED_AFTER,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
@@ -969,14 +1093,16 @@ red_a = normalize_reflectance(
 nir_b = normalize_reflectance(
     read_band_to_reference(
         NIR_BEFORE,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
 nir_a = normalize_reflectance(
     read_band_to_reference(
         NIR_AFTER,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
@@ -988,14 +1114,16 @@ nir_a = normalize_reflectance(
 swir_b = normalize_reflectance(
     read_band_to_reference(
         SWIR_BEFORE,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
 swir_a = normalize_reflectance(
     read_band_to_reference(
         SWIR_AFTER,
-        RGB_BEFORE
+        RGB_BEFORE,
+        aoi_window
     )
 )
 
@@ -1028,6 +1156,17 @@ for name, arr in [
             f"{arr.shape} != "
             f"{expected_shape}"
         )
+
+
+if expected_shape != (aoi_height, aoi_width):
+    raise RuntimeError(
+        "Spectral AOI grid does not match the RGB AOI: "
+        f"{expected_shape} != {(aoi_height, aoi_width)}"
+    )
+
+print(
+    f"Spectral AOI shape: {nir_b.shape}"
+)
 
 
 valid_mask = (
@@ -1124,22 +1263,19 @@ delta_ndmi = robust_abs_change(
 # SAVE SPECTRAL CHANGE
 # ============================================================
 
-save_float_tif(
-    OUT / "02_delta_NDVI.tif",
-    delta_ndvi,
-    ref_profile
+save_change_png(
+    OUT / "02_delta_NDVI.png",
+    delta_ndvi
 )
 
-save_float_tif(
-    OUT / "03_delta_NDBI.tif",
-    delta_ndbi,
-    ref_profile
+save_change_png(
+    OUT / "03_delta_NDBI.png",
+    delta_ndbi
 )
 
-save_float_tif(
-    OUT / "04_delta_NDMI.tif",
-    delta_ndmi,
-    ref_profile
+save_change_png(
+    OUT / "04_delta_NDMI.png",
+    delta_ndmi
 )
 
 
@@ -1185,10 +1321,9 @@ fused = np.nan_to_num(
 )
 
 
-save_float_tif(
-    OUT / "05_fused_change.tif",
-    fused,
-    ref_profile
+save_change_png(
+    OUT / "05_fused_change.png",
+    fused
 )
 
 
@@ -1249,17 +1384,9 @@ mask_uint8 = (
 )
 
 
-save_uint8_tif(
-    OUT / "06_change_candidates.tif",
-    mask_uint8,
-    ref_profile
-)
-
-
-Image.fromarray(
+save_mask_png(
+    OUT / "06_change_candidates.png",
     mask_uint8
-).save(
-    OUT / "06_change_candidates.png"
 )
 
 
@@ -1391,40 +1518,58 @@ crop_dir.mkdir(
 )
 
 
-def save_raw_rgb_crop(
+def save_rgb_png_crop(
     path,
     rgb,
     x1,
     y1,
     x2,
     y2,
-    reference_profile,
-    reference_transform
+    scale
 ):
 
-    """Save a crop without changing its values or dtype."""
+    """Save a consistently scaled RGB crop as PNG."""
 
     crop = rgb[:, y1:y2, x1:x2]
-    profile = reference_profile.copy()
-
-    profile.pop("blockxsize", None)
-    profile.pop("blockysize", None)
-    profile.pop("tiled", None)
-
-    profile.update(
-        driver="GTiff",
-        height=crop.shape[1],
-        width=crop.shape[2],
-        count=3,
-        dtype=str(crop.dtype),
-        transform=window_transform(
-            Window(x1, y1, x2 - x1, y2 - y1),
-            reference_transform
-        )
+    save_png_image(
+        Image.fromarray(
+            rgb_to_png(crop, scale),
+            mode="RGB"
+        ),
+        path
     )
 
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(crop)
+
+def save_change_overlay(path, rgb, mask, x1, y1, x2, y2, scale):
+
+    """Save the RGB crop with detected changes highlighted in red."""
+
+    base = Image.fromarray(
+        rgb_to_png(rgb[:, y1:y2, x1:x2], scale),
+        mode="RGB"
+    ).convert("RGBA")
+
+    alpha = np.where(
+        mask[y1:y2, x1:x2] > 0,
+        180,
+        0
+    ).astype(np.uint8)
+
+    overlay = np.zeros(
+        (alpha.shape[0], alpha.shape[1], 4),
+        dtype=np.uint8
+    )
+    overlay[..., 0] = 255
+    overlay[..., 1] = 40
+    overlay[..., 2] = 40
+    overlay[..., 3] = alpha
+
+    result = Image.alpha_composite(
+        base,
+        Image.fromarray(overlay, mode="RGBA")
+    ).convert("RGB")
+
+    save_png_image(result, path)
 
 
 for idx, region in enumerate(
@@ -1460,22 +1605,12 @@ for idx, region in enumerate(
         maxc + margin
     )
 
-
-    before_crop = \
-        rgb_before[
-            :,
-            y1:y2,
-            x1:x2
-        ]
-
-
-    after_crop = \
-        rgb_after_output[
-            :,
-            y1:y2,
-            x1:x2
-        ]
-
+    if x2 <= x1 or y2 <= y1:
+        print(
+            f"Skipping empty candidate crop {idx + 1}: "
+            f"x={x1}:{x2}, y={y1}:{y2}"
+        )
+        continue
 
     candidate_mask = \
         mask_uint8[
@@ -1484,35 +1619,45 @@ for idx, region in enumerate(
         ]
 
 
-    save_raw_rgb_crop(
+    save_rgb_png_crop(
         crop_dir /
-        f"{idx+1:03d}_before.tif",
-        before_crop,
+        f"{idx+1:03d}_before.png",
+        rgb_before,
         x1,
         y1,
         x2,
         y2,
-        ref_profile,
-        ref_transform
+        png_rgb_scale
     )
 
 
-    save_raw_rgb_crop(
+    save_rgb_png_crop(
         crop_dir /
-        f"{idx+1:03d}_after.tif",
-        after_crop,
+        f"{idx+1:03d}_after.png",
+        rgb_after_output,
         x1,
         y1,
         x2,
         y2,
-        profile_after_output,
-        transform_after_output
+        png_rgb_scale
     )
 
 
-    Image.fromarray(
-        candidate_mask
-    ).save(
+    save_change_overlay(
+        crop_dir /
+        f"{idx+1:03d}_changes.png",
+        rgb_after_output,
+        mask_uint8,
+        x1,
+        y1,
+        x2,
+        y2,
+        png_rgb_scale
+    )
+
+
+    save_png_image(
+        Image.fromarray(candidate_mask),
         crop_dir /
         f"{idx+1:03d}_mask.png"
     )

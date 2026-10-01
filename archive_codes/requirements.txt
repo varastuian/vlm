@@ -1,0 +1,9 @@
+torch
+torchvision
+einops
+opencv-python-headless
+numpy
+requests
+scikit-image
+pystac-client
+rasterio
