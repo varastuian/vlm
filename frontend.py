@@ -45,7 +45,7 @@ except Exception:  # noqa: BLE001
 HERE = Path(__file__).resolve().parent
 DEFAULT_DATA = Path(os.environ.get("RS_DATA_DIR", HERE / "data/aoi_products/crops"))
 REFERENCE_TIF = "change_detection_classified_result.tif"
-DEFAULT_AOI = (328, 784, 225, 225)      # x, y, w, h in native pixels
+DEFAULT_AOI = (228, 984, 225, 225)      # x, y, w, h in native pixels
 MAX_AOI = 1200                          # px per side, keeps laptop memory in check
 
 st.set_page_config(page_title="Sentinel VLM change detection", layout="wide")
@@ -326,7 +326,7 @@ m[4].metric("Co-registration shift", "%.2f, %.2f px" % res.diag["shift_px"])
 c = st.columns(4)
 c[0].image(before_rgb, caption=f"Before {fmt_date(bdate)}", width="stretch")
 c[1].image(after_rgb, caption=f"After {fmt_date(adate)}", width="stretch")
-c[2].image(cc.draw_regions(overlay, res.regions, verdicts, only=visible_ids),
+c[2].image(cc.draw_regions(after_rgb, res.regions, verdicts, only=visible_ids),
            caption="Detected changes (box: yellow unreviewed, green VLM-confirmed, red rejected)",
            width="stretch")
 c[3].image(cc.heatmap(res.T, res.valid), caption="Change significance (-log10 p)", width="stretch")
