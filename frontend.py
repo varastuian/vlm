@@ -43,12 +43,12 @@ except Exception:  # noqa: BLE001
     CANVAS_OK = False
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_DATA = Path(os.environ.get("RS_DATA_DIR", HERE / "data"))
+DEFAULT_DATA = Path(os.environ.get("RS_DATA_DIR", HERE / "data/aoi_products/crops"))
 REFERENCE_TIF = "change_detection_classified_result.tif"
 DEFAULT_AOI = (328, 784, 225, 225)      # x, y, w, h in native pixels
 MAX_AOI = 1200                          # px per side, keeps laptop memory in check
 
-st.set_page_config(page_title="Sentinel-2 change detection + VLM", layout="wide")
+st.set_page_config(page_title="Sentinel VLM change detection", layout="wide")
 
 
 # --------------------------------------------------------------------------- #
@@ -196,9 +196,9 @@ def models_for(url, force=False):
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
-st.title("Sentinel-2 change detection + VLM")
-st.caption("IR-MAD statistical change detection with false-positive vetoes, then a local VLM "
-           "audits the regions and answers your questions.")
+# st.title("Sentinel VLM change detection")
+# st.caption("IR-MAD statistical change detection with false-positive vetoes, then a local VLM "
+#            "audits the regions and answers your questions.")
 
 sb = st.sidebar
 sb.header("Data")
