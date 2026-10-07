@@ -2,26 +2,35 @@
 change_core.py - false-positive-aware bi-temporal change detection for
 Sentinel-2 L2A band files (green / red / nir / swir16 / visual GeoTIFFs).
 
-Why this replaces the "percentile of a hand-weighted score" approach
---------------------------------------------------------------------
-The old calculate_change() flagged the top 10 % of candidate pixels no matter
-what, so an unchanged scene still produced ~10 % "changes", and two scenes with
-different processing baselines (a +1000 DN offset on newer L2A products) look
-like they changed everywhere.  This module instead:
+Pipeline (who is responsible for what)
+--------------------------------------
+  Sentinel-2 T1/T2 (STAC assets, already on the same grid)
+      -> alignment VALIDATION (no co-registration is performed here)
+      -> IR-MAD ........................ STATISTICAL change evidence (T, p-values)
+      -> irmad_candidate ............... broad, high-recall statistical candidates
+      -> radiometric normalisation on IR-MAD-stable pixels
+      -> spectral land-cover transition evidence (NDVI / NDBI / MNDWI / brightness / SAM)
+      -> cand = irmad_candidate AND landcover_evidence
+      -> false-positive vetoes (brightness-only, water variability)
+      -> morphology / minimum-area / sliver filtering
+      -> optional semantic filter (DINOv2 map, interface unchanged)
+      -> region extraction (+ per-region significance gate)
+      -> optional structure gate (shape + spectral, buildings/roads)
 
-  1. Reads reflectance honouring GeoTIFF scale/offset tags.
-  2. Masks nodata, cloud and snow (heuristic - no SCL band is available).
-  3. Co-registers the pair to sub-pixel accuracy (phase correlation).
-  4. Runs IR-MAD (iteratively re-weighted multivariate alteration detection).
-     It is invariant to any per-band linear radiometric difference
-     (illumination, atmosphere, processing offset) and yields a chi-square
-     statistic, so the threshold is a p-value, not a guessed percentile.
-  5. Uses hysteresis thresholding (strong seeds + weak growth).
-  6. Radiometrically normalises the "after" image using only the pixels IR-MAD
-     believes are unchanged, then computes physically meaningful deltas.
-  7. Vetoes look-alikes: brightness-only shifts (soil moisture, sun angle),
-     water-surface variability, 1-2 px co-registration slivers, tiny specks.
-  8. Optionally requires agreement from an external semantic map (DINOv2).
+Downstream stages that are NOT in this module:
+      semantic verification ........... DINO feature change between T1 and T2
+      object classification ........... Qwen2.5-VL (vlm_qa.py)
+      precise footprints .............. SAM2
+
+This module only produces "high-recall but selective" candidates.  Nothing here is a
+building classifier.
+
+Why IR-MAD alone is not the definition of change
+------------------------------------------------
+IR-MAD flags any pixel whose joint spectral relationship between T1 and T2 is unusual.
+On arid scenes that includes ploughing, tillage, soil moisture and crop residue on bare
+soil - statistically significant, but not a land-cover transition.  So IR-MAD only
+nominates candidates; a candidate must ALSO show plausible transition evidence.
 """
 from __future__ import annotations
 
@@ -35,6 +44,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window, from_bounds
+from rasterio.windows import transform as window_transform
 from scipy import ndimage as ndi
 from scipy.linalg import eigh
 from scipy.stats import chi2
@@ -42,6 +52,8 @@ from skimage.filters import apply_hysteresis_threshold, threshold_otsu
 from skimage.morphology import skeletonize
 
 DATE_RE = re.compile(r"_(\d{8})_")
+# Band order is load-bearing: index 0..3 = green, red, nir, swir16.
+#   NDVI  = nd(nir, red)      NDBI = nd(swir, nir)      MNDWI = nd(green, swir)
 BANDS = ("green", "red", "nir", "swir16")
 NB = len(BANDS)
 
@@ -61,6 +73,18 @@ CLASS_INFO = {
     6: ("dark surface appeared (asphalt / burn scar / wet soil)", (150, 60, 200)),
     7: ("other material change", (200, 200, 200)),
 }
+
+# --- land-cover transition thresholds (fixed on purpose; do not tune per screenshot) --- #
+VEG_LOSS_NDVI_BEFORE_MIN = 0.20
+VEG_LOSS_NDVI_AFTER_MAX = 0.15
+VEG_LOSS_DNDVI_MAX = -0.12
+VEG_GAIN_NDVI_AFTER_MIN = 0.25
+VEG_GAIN_DNDVI_MIN = 0.12
+WATER_MNDWI_MIN = 0.10
+WATER_DMNDWI = 0.20
+BUILT_NDVI_AFTER_MAX = 0.25
+BUILT_DNDBI_MIN = 0.08
+BUILT_DBRIGHT_MIN = 0.02
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +118,12 @@ class Scene:
     cloud: np.ndarray
     snow: np.ndarray
     calib: dict = field(default_factory=dict)
+    # ---- grid metadata of the SOURCE raster (used by validate_alignment) ---- #
+    crs: object = None            # source CRS
+    transform: object = None      # affine of the AOI window in the source raster
+    bounds: tuple = None          # AOI bounds in the source CRS
+    native_shape: tuple = None    # AOI window size in SOURCE pixels (rows, cols)
+    src_transform: object = None  # affine of the whole source raster (grid phase check)
 
 
 def _read_reflectance(path, bounds, shape):
@@ -157,7 +187,9 @@ def cloud_snow_masks(refl, nodata=None, min_cloud_px=50):
 
 
 def load_aoi_pair(scene_before, scene_after, x, y, w, h):
-    """Read one AOI (native px window on the AFTER visual grid) for both dates."""
+    """Read one AOI (native px window on the AFTER visual grid) for both dates.
+    Each Scene records the grid of its own SOURCE raster so detect_changes() can verify
+    that the two dates really share a grid instead of assuming it."""
     with rasterio.open(scene_after["visual"]) as ref:
         bounds = ref.window_bounds(Window(x, y, w, h))
         crs, res = ref.crs, (abs(ref.res[0]), abs(ref.res[1]))
@@ -166,6 +198,10 @@ def load_aoi_pair(scene_before, scene_after, x, y, w, h):
     for files in (scene_before, scene_after):
         with rasterio.open(files["visual"]) as s:
             b = bounds if s.crs == crs else transform_bounds(crs, s.crs, *bounds)
+            win = from_bounds(*b, transform=s.transform)
+            grid = dict(crs=s.crs, transform=window_transform(win, s.transform), bounds=tuple(b),
+                        native_shape=(int(round(win.height)), int(round(win.width))),
+                        src_transform=s.transform)
         bands, nod, hows = [], np.zeros(shape, bool), {}
         for name in BANDS:
             refl, nd_, how = _read_reflectance(files[name], b, shape)
@@ -176,13 +212,58 @@ def load_aoi_pair(scene_before, scene_after, x, y, w, h):
         cloud, snow = cloud_snow_masks(refl, nod)
         bad = ndi.binary_dilation(cloud | snow, structure=np.ones((3, 3)), iterations=4)
         out.append(Scene(refl=refl, rgb=_read_rgb(files["visual"], b, shape), nodata=nod,
-                         bad=bad, cloud=cloud, snow=snow, calib=hows))
+                         bad=bad, cloud=cloud, snow=snow, calib=hows, **grid))
     meta = {"bounds": bounds, "crs": crs, "res": res}
     return out[0], out[1], meta
 
 
 # --------------------------------------------------------------------------- #
-# Co-registration
+# Alignment validation (replaces co-registration)
+# --------------------------------------------------------------------------- #
+def validate_alignment(before, after):
+    """Both dates must sit on the same grid. Nothing is resampled or shifted here.
+    Raises ValueError listing every mismatch."""
+    for name in ("crs", "transform", "bounds", "native_shape", "src_transform"):
+        if getattr(before, name, None) is None or getattr(after, name, None) is None:
+            raise ValueError(
+                f"Cannot verify alignment: Scene.{name} is missing. Build scenes with "
+                f"load_aoi_pair() (or fill crs/transform/bounds/native_shape/src_transform yourself).")
+    problems = []
+    if before.crs != after.crs:
+        problems.append(f"CRS differs: before={before.crs} after={after.crs}")
+    if before.refl.shape != after.refl.shape:
+        problems.append(f"array shape differs: before={before.refl.shape} after={after.refl.shape}")
+    if tuple(before.native_shape) != tuple(after.native_shape):
+        problems.append(f"source window size differs: before={before.native_shape} "
+                        f"after={after.native_shape} (different native resolution?)")
+    px = max(abs(after.transform.a), abs(after.transform.e))
+    tol = 1e-3 * px                                   # 1/1000 of a pixel
+    ta, tb = np.array(tuple(before.transform)[:6]), np.array(tuple(after.transform)[:6])
+    if not np.allclose(ta, tb, rtol=0.0, atol=tol):
+        problems.append(f"affine transform differs: before={tuple(before.transform)[:6]} "
+                        f"after={tuple(after.transform)[:6]}")
+    if not np.allclose(before.bounds, after.bounds, rtol=0.0, atol=tol):
+        problems.append(f"bounds differ: before={tuple(before.bounds)} after={tuple(after.bounds)}")
+    # The AOI-window transform inherits its origin from the requested bounds, so it cannot
+    # see a sub-pixel grid offset between the two source rasters. Check the grid phase of the
+    # full rasters: same pixel size, and origin offset must be a whole number of pixels.
+    sa, sb_ = before.src_transform, after.src_transform
+    if not np.allclose([sa.a, sa.b, sa.d, sa.e], [sb_.a, sb_.b, sb_.d, sb_.e], rtol=0.0, atol=1e-6 * px):
+        problems.append("source pixel size / rotation differs between dates")
+    else:
+        off_x, off_y = (sa.c - sb_.c) / sb_.a, (sa.f - sb_.f) / sb_.e
+        if abs(off_x - round(off_x)) > 1e-3 or abs(off_y - round(off_y)) > 1e-3:
+            problems.append(f"pixel grids are offset by a fractional pixel ({off_x:.3f}, {off_y:.3f} px)")
+    if problems:
+        raise ValueError(
+            "Before/after are NOT on the same grid, so they cannot be differenced pixel-by-pixel. "
+            "The STAC assets must be reprojected/resampled onto one grid BEFORE detection "
+            "(detect_changes() deliberately does not co-register or resample). Problems: "
+            + "; ".join(problems))
+
+
+# --------------------------------------------------------------------------- #
+# Co-registration (NOT used by detect_changes any more; kept for other callers)
 # --------------------------------------------------------------------------- #
 def _grad(img):
     g = cv2.GaussianBlur(img.astype(np.float32), (0, 0), 1.0)
@@ -280,12 +361,12 @@ def normalise_to(refl_b, refl_a, stable):
 class Params:
     sensitivity: str = "balanced"
     min_area_px: int = 5
-    sam_min: float = 0.05             # spectral angle (rad) below which change is brightness-only
+    sam_min: float = 0.05             # spectral angle in RADIANS; below this a change is brightness-only
     min_significance: float = 7.0     # region mean -log10(p) required (7 => p < 1e-7)
-    reject_slivers: bool = True       # drop <=2 px wide, short segments (misregistration edges)
+    reject_slivers: bool = True       # drop <=2 px wide, short segments (edge artefacts)
     ignore_water_variability: bool = True
-    coregister: bool = True
-    smooth_sigma: float = 1.0         # px; Gaussian blur of both dates before IR-MAD (kills misregistration/MTF noise)
+    coregister: bool = False          # DEPRECATED / ignored: detect_changes() validates alignment instead
+    smooth_sigma: float = 1.0         # px; Gaussian blur of both dates before IR-MAD
     calibrate: bool = True            # rescale T by the scene's measured overdispersion (never more sensitive)
     semantic_min_pct: float = 60.0    # only used when a semantic map is supplied
     # ---- shape / structure gate -------------------------------------------- #
@@ -316,7 +397,6 @@ class Result:
     indices: dict
     px_area_m2: float
     rejected: list = field(default_factory=list)   # regions removed by the structure gate (with reason)
-
 
 
 def refine_footprint(seg, cmag, pad=3):
@@ -412,6 +492,12 @@ def _position_word(cx, cy):
 def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m2=100.0,
                    semantic_map=None):
     params = params or Params()
+
+    # ======================================================================= #
+    # STAGE 0 - alignment VALIDATION. No co-registration, no resampling, no shifting.
+    # ======================================================================= #
+    validate_alignment(before, after)
+
     H, W = before.refl.shape[:2]
     valid = ~(before.nodata | after.nodata | before.bad | after.bad)
     if valid.sum() < 100:
@@ -419,15 +505,18 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     funnel = [("AOI pixels", H * W), ("valid (no nodata / cloud / snow)", int(valid.sum()))]
     diag = {"cloud_pct": float(100 * (before.cloud | after.cloud).mean()),
             "snow_pct": float(100 * (before.snow | after.snow).mean()),
-            "calibration_before": before.calib, "calibration_after": after.calib}
+            "calibration_before": before.calib, "calibration_after": after.calib,
+            # kept so existing UI code reading diag["shift_px"] keeps working
+            "shift_px": (0.0, 0.0), "shift_response": 0.0,
+            "alignment": "validated identical grid (no co-registration performed)"}
 
     Xb, Xa = before.refl, after.refl
-    dx = dy = resp = 0.0
-    if params.coregister:
-        Xa, dx, dy, resp = coregister(Xb, Xa)
-    diag.update(shift_px=(dx, dy), shift_response=resp)
 
-    # ---- IR-MAD ---------------------------------------------------------- #
+    # ======================================================================= #
+    # STAGE 1 - STATISTICAL change evidence (IR-MAD).
+    #   T = statistical evidence that the spectral relationship between T1 and T2 is
+    #   unusual. It says "something is odd here", NOT "land cover changed".
+    # ======================================================================= #
     def _smooth(x):
         if params.smooth_sigma <= 0:
             return x
@@ -446,16 +535,20 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     a_hi, a_lo = PRESETS[params.sensitivity]
     t_hi, t_lo = chi2.isf(a_hi, NB), chi2.isf(a_lo, NB)
     diag["thresholds_T"] = (float(t_lo), float(t_hi))
-    cand = apply_hysteresis_threshold(T, t_lo, t_hi) & valid
-    funnel.append(("IR-MAD significant (hysteresis)", int(cand.sum())))
 
-    # ---- normalise AFTER on unchanged pixels, build indices -------------- #
+    # Statistical CANDIDATES only - not "confirmed change".
+    irmad_candidate = apply_hysteresis_threshold(T, t_lo, t_hi) & valid
+    funnel.append(("IR-MAD candidate (statistical only)", int(irmad_candidate.sum())))
+
+    # ======================================================================= #
+    # STAGE 2 - radiometric normalisation on IR-MAD-stable pixels, then spectral features.
+    # ======================================================================= #
     stable = (chi2.sf(T, NB) > 0.5) & valid
     Xa_n, fits = normalise_to(Xb, Xa, stable)
     diag["normalisation_fit"] = fits            # slope, intercept per band (after -> before)
     cmag = np.linalg.norm(np.stack([cv2.GaussianBlur((Xa_n - Xb)[..., i], (0, 0), 0.6)
                                     for i in range(NB)], -1), axis=-1)
-    gb, rb, nb_, sb = (Xb[..., i] for i in range(4))
+    gb, rb, nb_, sb = (Xb[..., i] for i in range(4))        # green, red, nir, swir16
     ga, ra, na, sa = (Xa_n[..., i] for i in range(4))
     ndvi_b, ndvi_a = nd(nb_, rb), nd(na, ra)
     ndbi_b, ndbi_a = nd(sb, nb_), nd(sa, na)
@@ -468,29 +561,63 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     sam = np.arccos(np.clip(dot / (np.linalg.norm(Sb, axis=-1) * np.linalg.norm(Sa, axis=-1) + 1e-9),
                             -1, 1)).astype(np.float32)
 
-    # ---- pixel classes ---------------------------------------------------- #
-    veg_loss = (d["dNDVI"] < -0.10) & (ndvi_b > 0.12)
-    veg_gain = (d["dNDVI"] > 0.10) & (ndvi_a > 0.12)
-    w_gain = (mndwi_a > 0.10) & (d["dMNDWI"] > 0.20)
-    w_loss = (mndwi_b > 0.10) & (d["dMNDWI"] < -0.20)
-    bright_new = (ndvi_a < 0.20) & (d["dBright"] > 0.02)
+    # ======================================================================= #
+    # STAGE 3 - SPECTRAL LAND-COVER TRANSITION EVIDENCE (explicit, fixed thresholds).
+    # ======================================================================= #
+    veg_loss = ((ndvi_b > VEG_LOSS_NDVI_BEFORE_MIN) & (ndvi_a < VEG_LOSS_NDVI_AFTER_MAX)
+                & (d["dNDVI"] < VEG_LOSS_DNDVI_MAX))
+    veg_gain = (ndvi_a > VEG_GAIN_NDVI_AFTER_MIN) & (d["dNDVI"] > VEG_GAIN_DNDVI_MIN)
+    w_gain = (mndwi_a > WATER_MNDWI_MIN) & (d["dMNDWI"] > WATER_DMNDWI)
+    w_loss = (mndwi_b > WATER_MNDWI_MIN) & (d["dMNDWI"] < -WATER_DMNDWI)
+
+    # built_candidate is NOT a building classifier. It is only spectral evidence that a
+    # non-vegetated, brighter, SWIR-richer surface with a changed spectral SHAPE appeared.
+    # NDBI alone cannot identify buildings (bare soil also has high NDBI), which is why
+    # it is combined with low NDVI, a brightness increase and a real spectral-angle change.
+    # Telling roofs from soil is the job of the later semantic / VLM / SAM2 stages.
+    built_candidate = ((ndvi_a < BUILT_NDVI_AFTER_MAX) & (d["dNDBI"] > BUILT_DNDBI_MIN)
+                       & (d["dBright"] > BUILT_DBRIGHT_MIN) & (sam > params.sam_min))
+
+    landcover_evidence = veg_loss | veg_gain | w_gain | w_loss | built_candidate
+    funnel.append(("land-cover evidence (all valid px, before IR-MAD gate)",
+                   int((landcover_evidence & valid).sum())))
+
+    # THE KEY GATE: a pixel must be statistically odd AND show a plausible transition.
+    cand = irmad_candidate & landcover_evidence & valid
+    funnel.append(("combined candidate (IR-MAD AND land-cover evidence)", int(cand.sum())))
+
+    rules = {"veg_loss": veg_loss, "veg_gain": veg_gain, "w_gain": w_gain, "w_loss": w_loss,
+             "built_candidate": built_candidate, "landcover_evidence": landcover_evidence}
+    diag["evidence_px_valid"] = {k: int((v & valid).sum()) for k, v in rules.items()}
+    diag["evidence_px_in_irmad"] = {k: int((v & irmad_candidate).sum()) for k, v in rules.items()}
+    diag["irmad_candidates_without_evidence_px"] = int((irmad_candidate & ~landcover_evidence).sum())
+
+    # Pixel class map (used to label regions). Later = higher priority. dark_new only labels
+    # pixels that carry no other evidence (e.g. morphology fill) - it is not a candidate rule.
     dark_new = (ndvi_a < 0.20) & (ndvi_b < 0.20) & (d["dBright"] < -0.02)
     cls = np.full((H, W), 7, np.uint8)
-    for code, m in ((6, dark_new), (3, veg_gain), (2, veg_loss), (1, bright_new),
-                    (5, w_loss), (4, w_gain)):          # later = higher priority
-        cls[m] = code
+    for code, m_ in ((6, dark_new), (3, veg_gain), (2, veg_loss), (1, built_candidate),
+                     (5, w_loss), (4, w_gain)):
+        cls[m_] = code
 
-    # ---- false-positive vetoes ------------------------------------------- #
+    # ======================================================================= #
+    # STAGE 4 - false-positive vetoes
+    # ======================================================================= #
     m = cand.copy()
     brightness_only = ((sam < params.sam_min) & (np.abs(d["dNDVI"]) < 0.05)
-                       & (np.abs(d["dNDBI"]) < 0.05) & ~(w_gain | w_loss))
+                       & (np.abs(d["dNDBI"]) < 0.05) & (np.abs(d["dMNDWI"]) < 0.05))
     m &= ~brightness_only
     funnel.append(("after brightness-only veto (moisture / sun angle)", int(m.sum())))
     if params.ignore_water_variability:
         both_water = (mndwi_b > 0.10) & (mndwi_a > 0.10) & ~(w_gain | w_loss)
         m &= ~both_water
         funnel.append(("after water-surface variability veto", int(m.sum())))
+    else:
+        funnel.append(("water-surface variability veto (disabled)", int(m.sum())))
 
+    # ======================================================================= #
+    # STAGE 5 - morphology / minimum-area / sliver filtering
+    # ======================================================================= #
     m8 = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     m8 &= valid.astype(np.uint8)
     labels, n = ndi.label(m8, structure=np.ones((3, 3)))
@@ -502,18 +629,27 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
             maxdt = ndi.maximum(edt, labels, index=np.arange(1, n + 1))
             keep &= ~((maxdt <= 1.0) & (areas < 12))
         m8 = np.isin(labels, np.flatnonzero(keep) + 1).astype(np.uint8)
-    funnel.append((f"after size / sliver filter (min {params.min_area_px} px)", int(m8.sum())))
+    funnel.append((f"morphology / size filter (min {params.min_area_px} px)", int(m8.sum())))
 
-    # ---- optional semantic agreement -------------------------------------- #
+    # ======================================================================= #
+    # STAGE 6 - optional semantic filter. Kept ONLY for interface compatibility.
+    #   This keeps regions whose mean semantic score is above a percentile of the AOI; it is
+    #   a score filter on ONE map, NOT a semantic change detector. A proper one compares DINO
+    #   features of T1 and T2 per location. It is deliberately separate from the spectral stages.
+    # ======================================================================= #
     if semantic_map is not None:
         thr = np.percentile(semantic_map[valid], params.semantic_min_pct)
         labels, n = ndi.label(m8, structure=np.ones((3, 3)))
         if n:
             means = ndi.mean(semantic_map, labels, index=np.arange(1, n + 1))
             m8 = np.isin(labels, np.flatnonzero(means >= thr) + 1).astype(np.uint8)
-        funnel.append(("after semantic (DINOv2) agreement", int(m8.sum())))
+        funnel.append(("DINO filter (percentile score map)", int(m8.sum())))
+    else:
+        funnel.append(("DINO filter (not used)", int(m8.sum())))
 
-    # ---- regions ----------------------------------------------------------- #
+    # ======================================================================= #
+    # STAGE 7 - region extraction (+ significance gate, + optional structure gate)
+    # ======================================================================= #
     labels, n = ndi.label(m8, structure=np.ones((3, 3)))
     neglogp = np.minimum(-np.log10(np.maximum(chi2.sf(T, NB), 1e-300)), 20.0)
     regions, final = [], np.zeros((H, W), np.uint8)
@@ -586,9 +722,14 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     if params.target == "structures":
         funnel.append((f"structure gate (shape + spectral): rejected {len(rejected)} regions", int(final.sum())))
     funnel.append(("final regions", len(regions)))
+
+    # Debug masks (stored in `indices` so the Result API is unchanged). See debug_masks().
+    dbg = {"irmad_candidate": irmad_candidate, "veg_loss": veg_loss, "veg_gain": veg_gain,
+           "w_gain": w_gain, "w_loss": w_loss, "built_candidate": built_candidate,
+           "landcover_evidence": landcover_evidence, "cand": cand}
     return Result(T=T, mask=final, labels=new_labels, class_map=cls, regions=regions,
                   funnel=funnel, diag=diag, valid=valid, sam=sam, px_area_m2=px_area_m2,
-                  indices={"ndvi_b": ndvi_b, "ndvi_a": ndvi_a, **d}, rejected=rejected)
+                  indices={"ndvi_b": ndvi_b, "ndvi_a": ndvi_a, **d, **dbg}, rejected=rejected)
 
 
 # --------------------------------------------------------------------------- #
@@ -609,6 +750,32 @@ def heatmap(T, valid):
     p[~valid] = 0
     return cv2.cvtColor(cv2.applyColorMap((p * 255).astype(np.uint8), cv2.COLORMAP_INFERNO),
                         cv2.COLOR_BGR2RGB)
+
+
+DEBUG_MASK_ORDER = ("irmad_candidate", "veg_loss", "veg_gain", "w_gain", "w_loss",
+                    "built_candidate", "landcover_evidence", "cand")
+
+
+def debug_masks(res: Result):
+    """name -> array for every stage: T (continuous), the boolean stage masks, and the final mask.
+    Use it to see whether soil false positives come from IR-MAD or from the spectral rules."""
+    out = {"T": res.T}
+    out.update({k: res.indices[k] for k in DEBUG_MASK_ORDER})
+    out["final_mask"] = res.mask.astype(bool)
+    return out
+
+
+def debug_panel(res: Result, rgb=None):
+    """name -> RGB uint8 image for each debug mask (T as the usual heatmap; masks white-on-dark,
+    optionally blended over `rgb`)."""
+    panel = {"T": heatmap(res.T, res.valid)}
+    for name, m in debug_masks(res).items():
+        if name == "T":
+            continue
+        img = np.full((*m.shape, 3), 25, np.uint8) if rgb is None else (rgb * 0.45).astype(np.uint8)
+        img[m.astype(bool)] = (255, 255, 255) if rgb is None else (255, 60, 0)
+        panel[name] = img
+    return panel
 
 
 def draw_regions(rgb, regions, verdicts=None, only=None):
