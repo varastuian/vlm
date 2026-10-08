@@ -72,6 +72,7 @@ CLASS_INFO = {
     5: ("water disappeared", (0, 220, 220)),
     6: ("dark surface appeared (asphalt / burn scar / wet soil)", (150, 60, 200)),
     7: ("other material change", (200, 200, 200)),
+    8: ("construction site / active earthworks", (255, 100, 100)),
 }
 
 # --- land-cover transition thresholds (fixed on purpose; do not tune per screenshot) --- #
@@ -82,9 +83,19 @@ VEG_GAIN_NDVI_AFTER_MIN = 0.25
 VEG_GAIN_DNDVI_MIN = 0.12
 WATER_MNDWI_MIN = 0.10
 WATER_DMNDWI = 0.20
+
+# Built surface (finished buildings/pavement) - strict thresholds
 BUILT_NDVI_AFTER_MAX = 0.25
 BUILT_DNDBI_MIN = 0.08
 BUILT_DBRIGHT_MIN = 0.02
+
+# Construction site / active earthworks - relaxed spectral, distinct texture
+# Key: soil disturbance (dBright can be negative initially), NDBI rise, low NDVI, high spectral angle (shape change)
+CONSTR_NDVI_AFTER_MAX = 0.40        # allow partial vegetation during construction
+CONSTR_DNDBI_MIN = 0.04             # NDBI rises as soil exposed
+CONSTR_DBRIGHT_MIN = -0.03          # can be darker (excavation) or brighter (materials)
+CONSTR_SAM_MIN = 0.08               # spectral shape MUST change (disturbed soil != veg)
+CONSTR_TEXTURE_MIN = 0.15           # edge density increase (structure detector)
 
 
 # --------------------------------------------------------------------------- #
@@ -469,16 +480,25 @@ def structure_verdict(reg, ndvi_after, p):
     if nv > p.max_ndvi_after:
         return False, f"still vegetated afterwards (NDVI {nv:.2f})"
     if kind == "tiny":
-        ok = code in (1, 7) and reg["significance"] >= p.tiny_min_significance
+        ok = code in (1, 7, 8) and reg["significance"] >= p.tiny_min_significance
         return ok, "" if ok else "too small to confirm a structure"
     if kind == "road-like":
-        return (True, "") if code in (1, 2, 6, 7) else (False, "thin line but spectral type is not road-like")
+        return (True, "") if code in (1, 2, 6, 7, 8) else (False, "thin line but spectral type is not road-like")
     if kind == "building-like":
         if code == 6:
             return False, "dark compact patch - wet ground / shadow, not a roof (dark = road only if linear)"
-        return (True, "") if code in (1, 2, 7) else (False, "rectangular but water/vegetation change")
+        return (True, "") if code in (1, 2, 7, 8) else (False, "rectangular but water/vegetation change")
     if kind.startswith("large rectangle"):
+        # Allow large rectangles if they're construction sites (code 8)
+        if code == 8:
+            return (True, "")
         return False, f"rectangle larger than {p.building_max_px} px - looks like a farm plot"
+    # Allow irregular shapes for construction sites (code 8) - they're inherently irregular
+    if code == 8:
+        # Construction sites: require significance and spectral evidence, but not rectangular shape
+        if reg["significance"] >= p.min_significance:
+            return (True, "")
+        return False, "construction candidate but low statistical significance"
     return False, (f"irregular outline (rectangularity {reg['rectangularity']}, "
                    f"solidity {reg['solidity']}) - not a building or road")
 
@@ -578,7 +598,16 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     built_candidate = ((ndvi_a < BUILT_NDVI_AFTER_MAX) & (d["dNDBI"] > BUILT_DNDBI_MIN)
                        & (d["dBright"] > BUILT_DBRIGHT_MIN) & (sam > params.sam_min))
 
-    landcover_evidence = veg_loss | veg_gain | w_gain | w_loss | built_candidate
+    # construction_candidate: active earthworks / construction sites
+    # Distinct from finished buildings: can be darker (excavation), partial vegetation,
+    # but MUST show spectral shape change (sam) and NDBI rise from soil exposure.
+    # CRITICAL: stricter thresholds to distinguish from agricultural changes
+    # (plowing, harvesting) which change spectral but don't add persistent structure.
+    # Construction: dNDBI rise + dBright positive (material added) + high SAM (structural change)
+    construction_candidate = ((ndvi_a < CONSTR_NDVI_AFTER_MAX) & (d["dNDBI"] > CONSTR_DNDBI_MIN)
+                              & (d["dBright"] > 0.01) & (sam > CONSTR_SAM_MIN))
+
+    landcover_evidence = veg_loss | veg_gain | w_gain | w_loss | built_candidate | construction_candidate
     funnel.append(("land-cover evidence (all valid px, before IR-MAD gate)",
                    int((landcover_evidence & valid).sum())))
 
@@ -587,7 +616,8 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     funnel.append(("combined candidate (IR-MAD AND land-cover evidence)", int(cand.sum())))
 
     rules = {"veg_loss": veg_loss, "veg_gain": veg_gain, "w_gain": w_gain, "w_loss": w_loss,
-             "built_candidate": built_candidate, "landcover_evidence": landcover_evidence}
+             "built_candidate": built_candidate, "construction_candidate": construction_candidate,
+             "landcover_evidence": landcover_evidence}
     diag["evidence_px_valid"] = {k: int((v & valid).sum()) for k, v in rules.items()}
     diag["evidence_px_in_irmad"] = {k: int((v & irmad_candidate).sum()) for k, v in rules.items()}
     diag["irmad_candidates_without_evidence_px"] = int((irmad_candidate & ~landcover_evidence).sum())
@@ -596,8 +626,9 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     # pixels that carry no other evidence (e.g. morphology fill) - it is not a candidate rule.
     dark_new = (ndvi_a < 0.20) & (ndvi_b < 0.20) & (d["dBright"] < -0.02)
     cls = np.full((H, W), 7, np.uint8)
-    for code, m_ in ((6, dark_new), (3, veg_gain), (2, veg_loss), (1, built_candidate),
-                     (5, w_loss), (4, w_gain)):
+    for code, m_ in ((6, dark_new), (3, veg_gain), (2, veg_loss),
+                     (1, built_candidate), (5, w_loss), (4, w_gain),
+                     (8, construction_candidate)):
         cls[m_] = code
 
     # ======================================================================= #
@@ -726,6 +757,7 @@ def detect_changes(before: Scene, after: Scene, params: Params = None, px_area_m
     # Debug masks (stored in `indices` so the Result API is unchanged). See debug_masks().
     dbg = {"irmad_candidate": irmad_candidate, "veg_loss": veg_loss, "veg_gain": veg_gain,
            "w_gain": w_gain, "w_loss": w_loss, "built_candidate": built_candidate,
+           "construction_candidate": construction_candidate,
            "landcover_evidence": landcover_evidence, "cand": cand}
     return Result(T=T, mask=final, labels=new_labels, class_map=cls, regions=regions,
                   funnel=funnel, diag=diag, valid=valid, sam=sam, px_area_m2=px_area_m2,
@@ -753,7 +785,7 @@ def heatmap(T, valid):
 
 
 DEBUG_MASK_ORDER = ("irmad_candidate", "veg_loss", "veg_gain", "w_gain", "w_loss",
-                    "built_candidate", "landcover_evidence", "cand")
+                    "built_candidate", "construction_candidate", "landcover_evidence", "cand")
 
 
 def debug_masks(res: Result):

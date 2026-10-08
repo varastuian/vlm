@@ -49,6 +49,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_core as cc
 from detectors import dino_detector, load_dino, unload_detectors
 
+# VLM audit
+try:
+    from vlm_qa import audit as vlm_audit, build_montage as vlm_build_montage, evidence_table as vlm_evidence_table, list_models as vlm_list_models
+    VLM_AVAILABLE = True
+except ImportError:
+    VLM_AVAILABLE = False
+
 
 @dataclass
 class PipelineParams:
@@ -126,6 +133,15 @@ def parse_args():
     ap.add_argument("--min-region-score", type=float, default=0.2)
     ap.add_argument("--no-structure-gate", action="store_true")
     ap.add_argument("--all-changes", action="store_true", help="Disable structure gate (detect all changes)")
+    ap.add_argument("--building-max-px", type=int, default=500, help="Max building size in pixels (default 500 = 5 ha)")
+    
+    # VLM audit options
+    ap.add_argument("--vlm-model", default="qwen3-vl:4b-instruct", help="Ollama VLM model for audit")
+    ap.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama server URL")
+    ap.add_argument("--vlm-timeout", type=int, default=900, help="VLM timeout in seconds")
+    ap.add_argument("--no-vlm", action="store_true", help="Skip VLM audit stage")
+    ap.add_argument("--vlm-max-regions", type=int, default=20, help="Max regions per VLM batch (0 = all)")
+    ap.add_argument("--vlm-max-tokens", type=int, default=2048, help="Max tokens for VLM response")
     return ap.parse_args()
 
 
@@ -359,9 +375,33 @@ def enrich_regions(regions: List[Dict], irmad_result: cc.Result,
         r["spectral_angle_deg"] = round(float(np.degrees(irmad_result.sam[seg].mean())), 1)
         r["significance"] = round(float(-np.log10(np.maximum(cc.chi2.sf(irmad_result.T[seg], cc.NB), 1e-300)).mean()), 1)
         
-        cnt = np.bincount(irmad_result.class_map[seg], minlength=8)
+        # Class determination: prioritize construction_candidate if significant presence
+        const_frac = 0.0
+        built_frac = 0.0
+        veg_loss_frac = 0.0
+        struct_frac = 0.0
+        if "construction_candidate" in irmad_result.indices:
+            const_frac = float(irmad_result.indices["construction_candidate"][seg].mean())
+        if "built_candidate" in irmad_result.indices:
+            built_frac = float(irmad_result.indices["built_candidate"][seg].mean())
+        if "veg_loss" in irmad_result.indices:
+            veg_loss_frac = float(irmad_result.indices["veg_loss"][seg].mean())
+        if "structure" in per_signal:
+            struct_frac = float(per_signal["structure"][seg].mean())
+        
+        cnt = np.bincount(irmad_result.class_map[seg], minlength=9)
         cnt[0] = 0
-        code = int(cnt.argmax())
+        
+        # If region has significant construction/built/veg_loss evidence AND structure gain, classify as construction
+        # Construction sites show: soil disturbance + bright surfaces + vegetation removal + EDGE/TEXTURE GAIN
+        # Agriculture (plowing) shows spectral change but NO persistent edge gain
+        construction_score = const_frac + 0.5 * built_frac + 0.3 * veg_loss_frac
+        # Require structure signal > 0.15 to confirm construction (not just agriculture)
+        if construction_score > 0.22 and struct_frac > 0.15:
+            code = 8  # construction site
+        else:
+            code = int(cnt.argmax())
+        
         r["class_code"] = code
         r["class_name"] = cc.CLASS_INFO[code][0]
         r["area_ha"] = round(r["area_px"] * irmad_result.px_area_m2 / 10000.0, 3)
@@ -379,14 +419,31 @@ def enrich_regions(regions: List[Dict], irmad_result: cc.Result,
 
 
 def make_overlay(after_rgb: np.ndarray, regions: List[Dict]) -> np.ndarray:
-    """Create visualization overlay with numbered regions."""
+    """Create visualization overlay with numbered regions (region number only)."""
     vis = after_rgb.copy()
     for i, r in enumerate(regions, start=1):
-        color = (0, 200, 0)
+        color = (0, 200, 0)  # RGB green
         cnts, _ = cv2.findContours(r["seg"].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(vis, cnts, -1, color, 2)
         x, y, w, h = r["box"]
         cv2.putText(vis, f"#{i}", (x, max(14, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return vis
+
+
+def make_overlay_with_vlm(after_rgb: np.ndarray, regions: List[Dict], vlm_answers: Dict) -> np.ndarray:
+    """Create visualization overlay with VLM confirmation (region number + check/cross)."""
+    vis = after_rgb.copy()
+    for i, r in enumerate(regions, start=1):
+        vlm = r.get("vlm", {})
+        confirmed = vlm.get("real_change", False) if vlm else False
+        color = (0, 200, 0) if confirmed else (0, 100, 255)  # green = confirmed, orange = unconfirmed
+        cnts, _ = cv2.findContours(r["seg"].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, cnts, -1, color, 2)
+        x, y, w, h = r["box"]
+        label = f"#{i}"
+        if vlm:
+            label += " ✓" if confirmed else " ✗"
+        cv2.putText(vis, label, (x, max(14, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return vis
 
 
@@ -427,8 +484,10 @@ def score_card_image(fused: np.ndarray, per_signal: Dict[str, np.ndarray]) -> np
 
 
 def write_report(out_dir: str, regions: List[Dict], irmad_result: cc.Result, 
-                 params: PipelineParams, paths: Tuple[str, str], per_signal: Dict):
+                 params: PipelineParams, paths: Tuple[str, str], per_signal: Dict,
+                 vlm_answers: Dict = None):
     """Write text report with region details."""
+    vlm_answers = vlm_answers or {}
     lines = [
         f"Unified Sentinel-2 Change Detection Report — {datetime.now().isoformat(timespec='seconds')}",
         f"before: {paths[0]}",
@@ -438,16 +497,22 @@ def write_report(out_dir: str, regions: List[Dict], irmad_result: cc.Result,
         f"IR-MAD: sensitivity={params.sensitivity}, min_significance={params.min_significance}",
         f"DINOv2: model={params.dino_model}",
         f"structure_gate: {'enabled' if params.target_structures and not params.all_changes else 'disabled'}",
+        f"VLM audit: {'enabled' if vlm_answers else 'disabled'}",
         "",
     ]
     for i, r in enumerate(regions, start=1):
+        vlm = vlm_answers.get(i, r.get("vlm", {}))
+        vlm_status = "CONFIRMED" if vlm.get("real_change") else ("REJECTED" if vlm else "UNREVIEWED")
+        vlm_cat = vlm.get("category", "")
+        vlm_reason = vlm.get("reason", "")
         lines.append(
             f"#{i} box={r['box']} px={r['area_px']} ha={r['area_ha']} "
             f"score={r['score']:.2f} fired={'+'.join(sorted(r['sources'])) or 'none'} "
             f"class={r['class_name']} shape={r['shape']} "
             f"dNDVI={r['dNDVI']} dNDBI={r['dNDBI']} dMNDWI={r['dMNDWI']} "
             f"dBright={r['dBrightness']} SAM={r['spectral_angle_deg']:.1f}deg "
-            f"sig={r['significance']} rect={r['rectangularity']} solid={r['solidity']}"
+            f"sig={r['significance']} rect={r['rectangularity']} solid={r['solidity']} "
+            f"[{vlm_status}] {vlm_cat}: {vlm_reason}"
         )
     path = os.path.join(out_dir, "report.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -464,6 +529,7 @@ def save_debug_masks(out_dir: str, irmad_result: cc.Result, fused: np.ndarray,
     cv2.imwrite(os.path.join(out_dir, "irmad_candidate.png"), (irmad_result.indices["irmad_candidate"] * 255).astype(np.uint8))
     cv2.imwrite(os.path.join(out_dir, "landcover_evidence.png"), (irmad_result.indices["landcover_evidence"] * 255).astype(np.uint8))
     cv2.imwrite(os.path.join(out_dir, "built_candidate.png"), (irmad_result.indices["built_candidate"] * 255).astype(np.uint8))
+    cv2.imwrite(os.path.join(out_dir, "construction_candidate.png"), (irmad_result.indices.get("construction_candidate", np.zeros_like(cand)) * 255).astype(np.uint8))
     cv2.imwrite(os.path.join(out_dir, "veg_loss.png"), (irmad_result.indices["veg_loss"] * 255).astype(np.uint8))
     cv2.imwrite(os.path.join(out_dir, "veg_gain.png"), (irmad_result.indices["veg_gain"] * 255).astype(np.uint8))
     cv2.imwrite(os.path.join(out_dir, "water_gain.png"), (irmad_result.indices["w_gain"] * 255).astype(np.uint8))
@@ -511,6 +577,7 @@ def main():
         min_region_score=args.min_region_score,
         target_structures=not args.no_structure_gate,
         all_changes=args.all_changes,
+        building_max_px=args.building_max_px,
         output_dir=args.output_dir,
     )
     
@@ -550,13 +617,71 @@ def main():
     regions = enrich_regions(regions, irmad_result, per_signal, before, after)
     regions = merge_regions(regions, params.max_regions)
     regions = [r for r in regions if r["score"] >= params.min_region_score * 0.5]
+    # Assign sequential IDs to regions
+    for i, r in enumerate(regions, start=1):
+        r["id"] = i
     print(f"  Final regions: {len(regions)}")
+    
+    # Stage 6: VLM Audit (optional) - process all regions in batches
+    vlm_answers = {}
+    if regions and not args.no_vlm and VLM_AVAILABLE:
+        print("\n[7/7] Running VLM audit...")
+        try:
+            # Prepare data for VLM
+            before_rgb = cv2.cvtColor(before.rgb, cv2.COLOR_BGR2RGB)
+            after_rgb = cv2.cvtColor(after.rgb, cv2.COLOR_BGR2RGB)
+            
+            # Create labels array for vlm_build_montage
+            labels = np.zeros_like(before_rgb[:,:,0], dtype=np.int32)
+            for i, r in enumerate(regions, start=1):
+                labels[r["seg"]] = i
+            
+            # Process all regions in batches
+            batch_size = args.vlm_max_regions if args.vlm_max_regions > 0 else len(regions)
+            for batch_start in range(0, len(regions), batch_size):
+                batch_regions = regions[batch_start:batch_start + batch_size]
+                print(f"  VLM batch {batch_start//batch_size + 1}: regions {batch_start+1}-{min(batch_start+batch_size, len(regions))}")
+                
+                # Build montage and evidence table for this batch
+                montage = vlm_build_montage(before_rgb, after_rgb, labels, batch_regions, max_regions=len(batch_regions))
+                
+                table = vlm_evidence_table(batch_regions, 
+                                            cc.DATE_RE.search(args.before).group(1) if cc.DATE_RE.search(args.before) else "T1",
+                                            cc.DATE_RE.search(args.after).group(1) if cc.DATE_RE.search(args.after) else "T2",
+                                            f"AOI {before.refl.shape[1]}x{before.refl.shape[0]}px",
+                                            max_regions=len(batch_regions))
+                
+                batch_ids = [r["id"] for r in batch_regions]
+                batch_answers = vlm_audit(args.ollama_url, args.vlm_model, montage, table, 
+                                           batch_ids, timeout=args.vlm_timeout, max_tokens=args.vlm_max_tokens)
+                vlm_answers.update(batch_answers)
+            
+            # Attach VLM results to regions
+            for r in regions:
+                if r["id"] in vlm_answers:
+                    r["vlm"] = vlm_answers[r["id"]]
+                    r["vlm_confirmed"] = vlm_answers[r["id"]]["real_change"]
+                    r["vlm_category"] = vlm_answers[r["id"]]["category"]
+                    r["vlm_reason"] = vlm_answers[r["id"]]["reason"]
+            
+            n_confirmed = sum(1 for r in regions if r.get("vlm_confirmed", False))
+            print(f"  VLM confirmed: {n_confirmed}/{len(regions)} regions")
+            
+        except Exception as e:
+            print(f"  VLM audit failed: {e}")
+            import traceback
+            traceback.print_exc()
+    elif args.no_vlm:
+        print("\n[7/7] VLM audit skipped (--no-vlm)")
+    else:
+        print("\n[7/7] VLM audit skipped (vlm_qa not available or no regions)")
     
     # Save outputs
     print("\nSaving outputs...")
     save_debug_masks(args.output_dir, irmad_result, fused, per_signal, cand, after.rgb)
     
-    overlay = make_overlay(after.rgb, regions)
+    # Create overlay with VLM results
+    overlay = make_overlay_with_vlm(after.rgb, regions, vlm_answers)
     cv2.imwrite(os.path.join(args.output_dir, "overlay.png"), overlay)
     
     # Side-by-side before/after comparison
@@ -565,7 +690,7 @@ def main():
     print(f"  Saved side_by_side.png")
     
     report_path = write_report(args.output_dir, regions, irmad_result, params, 
-                               (args.before, args.after), per_signal)
+                               (args.before, args.after), per_signal, vlm_answers)
     
     # Save fused map as GeoTIFF
     with rasterio.open(Path(args.after)) as src:

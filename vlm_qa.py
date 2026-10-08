@@ -36,14 +36,17 @@ SYSTEM_PROMPT = (
     "CHANGE outline) and a table of measurements. Rules:\n"
     "1. A NEW BUILDING is a small, compact, near-rectangular bright or distinct object in AFTER that is "
     "absent in BEFORE. A NEW ROAD is a thin, long, mostly straight line in AFTER that is absent in BEFORE.\n"
-    "2. Colour, brightness, moisture, vegetation-vigour, ploughing/harvest or shadow differences of "
+    "2. A CONSTRUCTION SITE is an area of disturbed ground / bare soil in AFTER that was vegetated or "
+    "different in BEFORE. It appears as irregular patches, soil exposure, material piles, or excavation. "
+    "It does NOT need to be rectangular - irregular outlines are EXPECTED for construction.\n"
+    "3. Colour, brightness, moisture, vegetation-vigour, ploughing/harvest or shadow differences of "
     "fields or natural ground are NOT buildings or roads, even if the outlined area is rectangular. "
-    "Irregular or blob-like outlines are not buildings or roads.\n"
-    "3. Judge from the images first. The table's 'spectral hint' is an unreliable rule of thumb - never "
+    "Irregular or blob-like outlines are not buildings or roads (but CAN be construction sites).\n"
+    "4. Judge from the images first. The table's 'spectral hint' is an unreliable rule of thumb - never "
     "repeat it as a fact. 'shape' is a geometric measurement and is more trustworthy.\n"
-    "4. If no region clearly satisfies rule 1, answer that none of the regions look like new buildings "
-    "or roads. Saying 'none' or 'unclear' is a good answer.\n"
-    "5. Refer to regions as #<id>. Never invent regions, dates or objects. Be short and concrete."
+    "5. If no region clearly satisfies rule 1 or 2, answer that none of the regions look like new buildings, "
+    "roads, or construction sites. Saying 'none' or 'unclear' is a good answer.\n"
+    "6. Refer to regions as #<id>. Never invent regions, dates or objects. Be short and concrete."
 )
 
 
@@ -162,29 +165,45 @@ def _fmt_date(d):
 # --------------------------------------------------------------------------- #
 # Audit (false-positive filter)
 # --------------------------------------------------------------------------- #
-def audit(url, model, montage_rgb, table, region_ids, timeout=900):
+def audit(url, model, montage_rgb, table, region_ids, timeout=900, max_tokens=2048):
     """Returns {id: {'real_change': bool, 'category': str, 'reason': str}}."""
     prompt = (
         f"{table}\n\nFor EACH region in the montage decide whether the BEFORE and AFTER panels show "
-        "a REAL new structure (building or road) or a FALSE POSITIVE (cloud, shadow, haze, soil moisture, "
-        "lighting, season, crop or vegetation colour change, ploughing, misalignment, noise). "
-        "Set real_change=true ONLY for a distinct compact rectangular object or a thin straight line that "
-        "is absent in BEFORE. If the panels look alike or the change is only colour/brightness, it is a "
+        "a REAL change (new building, new road, construction site) or a FALSE POSITIVE (cloud, shadow, haze, "
+        "soil moisture, lighting, season, crop or vegetation colour change, ploughing, misalignment, noise). "
+        "Set real_change=true for:\n"
+        "  - A distinct compact rectangular object (building) absent in BEFORE\n"
+        "  - A thin straight line (road) absent in BEFORE\n"
+        "  - An area of disturbed ground / bare soil / excavation / material piles (construction site) "
+        "that was different in BEFORE - irregular outline is EXPECTED for construction\n"
+        "If the panels look alike or the change is only colour/brightness without structural change, it is a "
         "false positive.\n"
         'Reply with JSON only: {"regions":[{"id":<number>,"real_change":true|false,'
         f'"category":"<one of: {"; ".join(CATEGORIES)}>","reason":"<max 15 words>"}}]}}')
     msgs = [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt, "images": [_encode(montage_rgb)]}]
-    text = "".join(_chat_stream(url, model, msgs, fmt="json", max_tokens=1200, timeout=timeout))
+    text = "".join(_chat_stream(url, model, msgs, fmt="json", max_tokens=max_tokens, timeout=timeout))
     return parse_audit(text, region_ids)
 
 
 def parse_audit(text, region_ids):
+    # Try direct JSON parse first
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
+        # Try to extract JSON from markdown code blocks or prose
         m = re.search(r"\{.*\}", text, re.S)
-        data = json.loads(m.group(0)) if m else {}
+        if m:
+            json_str = m.group(0)
+            # Fix common JSON issues: trailing commas, missing quotes, etc.
+            json_str = re.sub(r",\s*([}\]])", r"\1", json_str)  # remove trailing commas
+            json_str = re.sub(r"([{,])\s*(\w+)\s*:", r'\1"\2":', json_str)  # quote unquoted keys
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                data = {}
+        else:
+            data = {}
     items = data.get("regions", data if isinstance(data, list) else [])
     out = {}
     for it in items:
@@ -204,11 +223,11 @@ def parse_audit(text, region_ids):
 # --------------------------------------------------------------------------- #
 # Free-form Q&A
 # --------------------------------------------------------------------------- #
-def stream_answer(url, model, question, history, montage_rgb, table, timeout=900):
+def stream_answer(url, model, question, history, montage_rgb, table, timeout=900, max_tokens=700):
     """Generator of text chunks. `history` = [{'role','content'}, ...] (text only)."""
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
     msgs.append({"role": "user",
                  "content": f"EVIDENCE TABLE\n{table}\n\nQUESTION: {question}",
                  "images": [_encode(montage_rgb)]})
-    yield from _chat_stream(url, model, msgs, max_tokens=700, timeout=timeout)
+    yield from _chat_stream(url, model, msgs, max_tokens=max_tokens, timeout=timeout)
