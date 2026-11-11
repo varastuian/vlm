@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tests"))
-from make_synthetic_data import make
+from vlm.make_synthetic_data import make
 
 LOG = []
 

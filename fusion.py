@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 try:
-    from . import bit_detector, dino_detector, spectral_detector, structure_detector
+    from .. import bit_detector, dino_detector, spectral_detector, structure_detector
 except ImportError:  # run as a plain script / from inside the package dir
     from detectors import (bit_detector, dino_detector, spectral_detector,
                            structure_detector)

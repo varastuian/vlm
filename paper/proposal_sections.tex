@@ -1,0 +1,212 @@
+\section{Proposed research: GReST-CD for reliable urban structural transitions}
+\label{sec:proposed}
+
+\subsection{Research question and contribution hypothesis}
+
+\textbf{Research question.} Can a model that explicitly separates residual geometric error, appearance-only perturbations, physical building change, and input-data reliability generalize better to unseen cities than a conventional single-head change detector, without sacrificing boundary fidelity or deployability?
+
+We propose \emph{GReST-CD} (\textbf{G}eometry- and \textbf{Re}liability-aware \textbf{S}tructural \textbf{T}ransition Change Detection), a \emph{research hypothesis and implementable model design}, not an experimentally validated architecture. The core idea is to make a prediction depend on evidence of a \emph{physical transition}, rather than on unconstrained spectral differences, and to return an explicit ``review required'' decision for unreliable regions. GReST-CD combines: (1) change-preserving residual alignment; (2) nuisance-counterfactual learning that leaves true urban edits unchanged; (3) date-specific footprint reasoning for construction and demolition \emph{when corresponding supervision exists}; (4) reliability-gated, optional normalized-height evidence; and (5) calibrated selective mapping with a transparent coverage--error trade-off.
+
+\paragraph{Relationship to recent studies and limits of originality.} Joint alignment and change learning have already been studied by \citet{Lu2026}; uncertainty-guided building change detection by \citet{LiUncertainty2025}; edge-aware modeling by \citet{Holail2025}; optical--DSM fusion by \citet{Fu2025}; and cross-city semi-supervision and evaluation by \citet{Srivastava2026}. Consequently, \emph{none} of these ingredients alone is claimed as new. The \emph{proposed contribution to test} is their integration under explicit causal-like nuisance interventions, optional-height gating, structurally consistent direction labels, and an operational abstention protocol, all evaluated together under geographic holdouts. Novelty and performance superiority would require a broader prior-art audit and actual controlled experiments.
+
+\subsection{Task definition and observability}
+
+Let $I_1,I_2\in\mathbb{R}^{H\times W\times C}$ be two radiometrically normalized, approximately co-registered optical images; $V_1,V_2\in\{0,1\}^{H\times W}$ denote usable-pixel masks (clouds, no-data, and extreme occlusion are invalid). Optional normalized digital surface models $H_1,H_2$ have independent validity/quality layers $V_H$ and $Q_H\in[0,1]^{H\times W}$. All maps are projected to a documented common coordinate system and ground sample distance. Target outputs are: a binary footprint-change probability $p_{\rm fp}$; when supervised, \emph{new}, \emph{removed}, and \emph{unchanged} building status; an optional height-only-change probability $p_{\rm ht}$; and an uncertainty/review flag. A changed road or vegetation patch is \emph{not} a positive building-footprint example unless the chosen label ontology explicitly includes it.
+
+\textbf{Identifiability condition.} A single building-change mask alone does \emph{not} label which date contains the building: a direction-aware head needs separate dated building masks or independently verified construction/demolition instances. Height-only modifications cannot be validated using LEVIR-CD or WHU-CD's usual 2D binary-change masks; they require two comparable elevation measurements and a height-change annotation protocol. When either kind of supervision is missing, its task-specific loss and corresponding claims are disabled, not imputed.
+
+\subsection{Architecture and data flow}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=5mm and 5mm,
+  stage/.style={draw=blue!55!black,fill=blue!5,rounded corners=2pt,thick,align=center,font=\footnotesize,text width=0.25\textwidth,minimum height=12mm},
+  smallstage/.style={draw=black!50,fill=black!3,rounded corners=2pt,align=center,font=\footnotesize,text width=0.25\textwidth,minimum height=12mm},
+  arr/.style={-{Stealth[length=2.5mm]},thick}
+]
+\node[stage] (a) {Paired imagery, validity masks\and optional DSMs};
+\node[stage,right=of a] (b) {Shared multiscale encoder\$F_1,F_2$};
+\node[stage,right=of b] (c) {Bounded residual registration\and quality masks};
+\node[stage,below=8mm of c] (d) {Reliability-gated difference\and optional height fusion};
+\node[stage,left=of d] (e) {Building-state and binary\change decoders};
+\node[smallstage,left=of e] (f) {Calibration and selective GIS\map: change / no change / review};
+\draw[arr] (a)--(b);\draw[arr] (b)--(c);
+\draw[arr] (c)--(d);\draw[arr] (d)--(e);\draw[arr] (e)--(f);
+\end{tikzpicture}
+\caption{Conceptual GReST-CD pipeline. Height evidence is optional and is fused only when valid. The figure is an architecture proposal, not a trained-system result.}
+\label{fig:grest}
+\end{figure}
+
+\paragraph{Stage A: change-preserving alignment.} A shared encoder $E_{\theta}$, initialized from a standard Siamese CNN or a frozen/pretrained visual backbone, produces multiscale features $F_t^s=E_{\theta}^s(I_t)$. A lightweight registration head predicts a bounded residual displacement field $d^s(x)$; the second feature map is resampled as
+\begin{equation}
+ \bar F_2^s(x)={\cal W}(F_2^s,d^s)(x),\qquad
+ d^s=\operatorname{clip}(A_{\phi}(F_1^s,F_2^s),-d_{\max},d_{\max}).
+ \label{eq:align}
+\end{equation}
+The \emph{coarse} image alignment occurs before learning. The residual head is only allowed to correct small acquisition offsets: $d_{\max}$ is set from the observed residual registration tolerance, rather than tuned on the test set. This prevents a flexible warp from moving or erasing newly constructed buildings to minimize feature differences. Define $q_{\rm uc}=\operatorname{stopgrad}[(1-\tilde p_{\rm fp})\,q_{\rm reg}\,V_1V_2]$, where $\tilde p_{\rm fp}$ is a detached preliminary change estimate and $q_{\rm reg}$ indicates reliable, nonoccluded correspondence. In supervised training, ground-truth unchanged regions can supervise or warm-start this mask. The alignment loss becomes
+\begin{equation}
+ {\cal L}_{\rm reg}=\frac{\sum_x q_{\rm uc}(x)\,\rho(F_1(x)-\bar F_2(x))}{\epsilon+\sum_x q_{\rm uc}(x)}
+ +\lambda_{\rm sm}\sum_x\|\nabla d(x)\|_1,
+ \label{eq:regloss}
+\end{equation}
+with a robust Huber/Charbonnier penalty $\rho$ and a spatial-smoothness term. To avoid self-fulfilling zero-confidence masks, correspondence quality is derived from independent matching diagnostics and known synthetic geometric corruptions, with gradients stopped through $q_{\rm uc}$. Models should be tested for \emph{over-alignment} on genuine construction events.
+
+\paragraph{Stage B: quality-gated structural evidence.} Let $D_o$ contain $|F_1-\bar F_2|$, $F_1\odot\bar F_2$, and multiscale context. A learned reliability indicator $q_o(x)\in[0,1]$, trained against known nuisance/validity perturbations rather than only binary change labels, modulates optical evidence. If a comparable height pair exists, define $\Delta H={\cal W}(H_2,d_H)-H_1$ in a common vertical datum and
+\begin{equation}
+ D(x)=\big[q_o(x)D_o(x),\;V_H(x)Q_H(x)\,\psi(\Delta H(x)),\;V_H(x)Q_H(x)\big].
+ \label{eq:fusion}
+\end{equation}
+Here $\psi$ encodes signed height differences, and $Q_H$ is a quality estimate from DSM metadata, stable-surface residuals, and predicted measurement uncertainty; \emph{it is not decreased merely because a large true height change is observed}. Missing height input is represented by a zero evidence tensor \emph{plus a missingness bit}, not a fictitious zero height change. Dropout of the height modality during training teaches the optical path to remain functional.
+
+\paragraph{Stage C: date-specific transitions and map outputs.} A shared decoder predicts per-date building probabilities $b_1,b_2$ if date-specific supervision exists. Assuming conditionally independent Bernoulli decisions \emph{for the purpose of deriving an auxiliary output}, construction and demolition probabilities are
+\begin{equation}
+ p_{\rm new}=(1-b_1)b_2,\qquad
+ p_{\rm rem}=b_1(1-b_2),\qquad
+ p_{\rm xor}=p_{\rm new}+p_{\rm rem}.
+ \label{eq:transition}
+\end{equation}
+A primary binary footprint head $p_{\rm fp}$ remains available on binary-only datasets. The consistency penalty $\|p_{\rm fp}-p_{\rm xor}\|_1$ is activated \emph{only} for datasets with per-date building supervision; otherwise an arbitrary construction/demolition split would be nonidentifiable. If height labels exist, an additional head detects height-only structural changes on regions with stable footprints, and outputs are reported separately rather than silently folded into a 2D footprint benchmark.
+
+\paragraph{Stage D: counterfactual nuisance consistency and selective reporting.} Generate two versions of the \emph{same} labeled image pair by perturbing acquisition properties---illumination, color response, physically plausible shadows, mild sensor noise, and known subpixel shifts---without editing actual building footprints. With $T^{-1}$ mapping augmented outputs back to original coordinates, encourage
+\begin{equation}
+ {\cal L}_{\rm inv}=\frac{\sum_{x\in\Omega_v}w(x)\,
+  \operatorname{JS}\big(p_{\rm fp}(I_1,I_2)(x),
+    T^{-1}p_{\rm fp}(T_1I_1,T_2I_2)(x)\big)}
+ {\epsilon+\sum_{x\in\Omega_v}w(x)},
+ \label{eq:invariance}
+\end{equation}
+where JS denotes Jensen--Shannon divergence between two Bernoulli predictive distributions, and $w$ excludes newly occluded/no-data pixels. Independently augmenting the dates is important: applying the same color change to both cannot teach invariance to differing sun or sensor conditions. Do not use synthetic building edits as nuisance transformations. At inference, calibrate the change-head probabilities by temperature scaling on \emph{training-domain validation/calibration regions}. Use a small deep ensemble or Monte Carlo dropout to estimate predictive disagreement $u(x)$; report a map label only when $u(x)\leq\tau_u$ and the data-validity criteria hold. Otherwise, emit \emph{review required}. This is selective prediction, \emph{not} a guaranteed conformal error bound on unseen cities.
+
+\subsection{Training and optimization}
+
+For valid pixels $\Omega_v$, combine class-balanced binary cross-entropy and soft Dice loss for footprint change:
+\begin{equation}
+ {\cal L}_{\rm fp}=\lambda_{\rm bce}\,{\rm BCE}_w(p_{\rm fp},Y_{\rm fp})
+  +\lambda_{\rm dice}\big(1-\operatorname{Dice}(p_{\rm fp},Y_{\rm fp})\big).
+ \label{eq:footloss}
+\end{equation}
+On datasets with compatible supervision, add per-date segmentation loss $\mathcal L_{\rm date}$, consistency $\mathcal L_{\rm trans}$, and height loss $\mathcal L_{\rm ht}$; otherwise their supervision masks are zero. The complete masked objective is
+\begin{equation}
+ \mathcal L=\mathcal L_{\rm fp}+\alpha\mathcal L_{\rm reg}
+ +\beta\mathcal L_{\rm inv}+m_{\rm date}(\gamma\mathcal L_{\rm date}+\delta\mathcal L_{\rm trans})
+ +m_{\rm ht}\zeta\mathcal L_{\rm ht}+\eta\mathcal L_{\rm quality},
+ \label{eq:total}
+\end{equation}
+where $m_{\rm date},m_{\rm ht}\in\{0,1\}$ denote actual annotation/modality availability, not learned proxies. $\mathcal L_{\rm quality}$ uses ground-truth synthetic corruption masks and registered control points where available, so reliability gating is not optimized to suppress all difficult pixels. We propose (i) a 10-epoch warm-up of the baseline footprint model with coarse registration frozen, (ii) joint feature/alignment optimization, and (iii) nuisance consistency and uncertainty calibration. All loss weights must be chosen on validation regions and ablated; their numerical values are \emph{hyperparameters to be determined}, not claimed optima.
+
+\section{Experimental methodology and reproducibility plan}
+\label{sec:experiment}
+
+\subsection{Datasets, splits, and annotation design}
+
+\begin{table}[htbp]
+\centering\footnotesize
+\caption{Planned evaluation settings. ``Available'' refers to the required type of data, not to data already downloaded or experiments completed.}
+\label{tab:protocol}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.21\textwidth}>{\raggedright\arraybackslash}p{0.31\textwidth}>{\raggedright\arraybackslash}p{0.36\textwidth}@{}}
+\toprule
+\tabhead{Setting} & \tabhead{Main purpose} & \tabhead{Important restriction}\\
+\midrule
+LEVIR-CD / WHU-CD & Comparable optical footprint-change baselines & Binary change only under standard labels; no validated direction or height-only score \\
+S2Looking & Stress test for off-nadir geometry and shadow artifacts & Not exclusively urban; use area-stratified reporting \\
+ICCD (if accessible) \citep{Srivastava2026} & Geographic transfer across Indian cities & Confirm licensing, access, labels and city-level partitions before use \\
+Multi-city held-out study & Realistic transfer and development-pattern diversity & Acquire independent permissions and \emph{new} city/site labels \\
+Matched optical + two-date DSM subset & Test change in height without footprint growth & Require same horizontal/vertical datum and independent elevation truth \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Public data should retain their official train/validation/test splits when making published-benchmark comparisons, with \emph{no} tile leakage. Geographic-generalization experiments require a separate city-diverse dataset or suitable city-labeled partitions; LEVIR-CD alone does not establish leave-one-city-out transfer. For a newly collected city corpus, reserve entire cities for testing, choose hyperparameters using distinct validation cities, and enforce a spatial buffer between sites. Record all sensors, acquisition dates, ground sample distance, cloud/occlusion masks, datum transforms, geographic bounds, and verification status. For change direction, independently digitize building footprints at each date and reconcile disagreements with a second annotator. For height-only change, use comparable DSMs or field-verified elevation, estimate vertical error from stable surfaces, and predefine a change threshold above sensor noise.
+
+\subsection{Baselines, training settings, and controlled stress tests}
+
+Compare with a well-tuned Siamese FCN \citep{Daudt2018}, STANet \citep{ChenShi2020}, BIT \citep{ChenBIT2022}, ChangeFormer \citep{Bandara2022}, and a current pretrained encoder such as ChangeDINO \citep{ChengHsu2026}. Compare against \citet{Lu2026} where implementation and identical input conditions are accessible. For a height-equipped cohort, include a DSM-based method such as DDDMNet \citep{Fu2025}; \emph{do not compare its multimodal scores with optical-only scores as if the inputs were equivalent}. Also include a strong \emph{same-backbone} ablation with only the proposed new modules removed, which provides the most direct estimate of their added value.
+
+An initial, \emph{non-optimized} reproducible recipe is native-resolution $512\times512$ crops; a batch size of 8 (adjusted only for memory, with gradient accumulation if needed); AdamW with a $10^{-4}$ starting learning rate, $0.05$ weight decay, cosine learning-rate decay, at most 100 epochs, and patience 15 based on validation $F_1$. Use at least three random seeds, identical augmentations and loss budgets where meaningful, and a single predeclared metric-selection policy. Tile inference with overlap and probability blending; report ground sample distance instead of resizing different sensors to an artificial common pixel resolution. Fix positive-class decision threshold and review threshold \emph{before test evaluation} on independent validation regions.
+
+Evaluate natural and controlled acquisition-shift strata. On held-out scenes inject known translations of 0, 1, 2, and 4 pixels, independent brightness/white-balance shifts, simulated cast shadows without editing labels, and mild blur/noise. Warp label coordinates consistently for geometric transformations. Separately evaluate \emph{real} cloud/shadow, seasonal, and off-nadir observations where ground truth can be checked. Synthetic corruption performance is a robustness diagnostic, not proof of real-world invariance.
+
+\subsection{Metrics and statistical analysis}
+
+The primary endpoint is changed-class $F_1$ on entirely held-out cities, paired with IoU and false-positive area per square kilometre. The \emph{same} input band count, annotation rules, thresholds, geospatial sampling frame, and reporting unit must be used for within-cohort comparisons. Also report boundary $F_1$ at a prespecified tolerance in \emph{metres}, instance-level construction/demolition precision and recall \emph{only on direction-labeled data}, and height-only precision/recall and height error where elevation reference data exist. Robustness is measured as score degradation between clean and shifted subsets. For uncertainty, report expected calibration error (ECE), Brier score, and selective error versus retained map coverage; coverage alone is not quality. Measure wall-clock time per square kilometre including preprocessing, peak GPU memory, model parameters, and total training energy or compute budget when feasible.
+
+Use paired geographical bootstrap confidence intervals resampling \emph{cities} (or independent sites if cities are too few), rather than treating correlated image pixels as independent observations. With few cities, acknowledge wide uncertainty and present per-city results. Prespecify the primary comparison (GReST-CD vs. its same-backbone baseline), report absolute percentage-point changes and confidence intervals, and treat secondary comparisons as exploratory. Do not claim a statistically meaningful improvement from a single-seed benchmark difference.
+
+\subsection{Ablations and failure analysis}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Planned ablation schedule. Each comparison must reuse splits, seeds, preprocessing, and annotation masks.}
+\label{tab:ablation}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.35\textwidth}>{\raggedright\arraybackslash}p{0.34\textwidth}@{}}
+\toprule
+\tabhead{Variant} & \tabhead{Changed component} & \tabhead{Main hypothesis to test}\\
+\midrule
+B0 & Same shared encoder + standard change decoder & Reproducible reference point\\
+B1 & B0 + residual change-preserving alignment & Fewer registration-induced false edges\\
+B2 & B1 + nuisance consistency and quality gating & Fewer shadow/illumination false positives\\
+B3 & B2 + supervised per-date building state (where possible) & Better construction/removal discrimination\\
+B4 & B2/B3 + optional DSM with quality/missingness gating & Additional height-only sensitivity without optical regression\\
+B5 & Best eligible model + post-hoc calibration/review policy & Lower error among accepted predictions at measured coverage\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Conduct additional \emph{interaction} tests (alignment on/off $\times$ nuisance gating on/off), because sequential improvements alone cannot separate component interactions. Assess at least the following failure categories: roofing-material changes without construction, cast-shadow displacement, vegetation touching rooflines, densely attached buildings, off-nadir parallax, DSM vertical-datum mismatch, and extreme domain shift. When the model abstains, save review areas as geographic polygons with uncertainty and data-quality attributes for human inspection.
+
+\section{Results: analytical check, hypotheses, and reporting template}
+\label{sec:results}
+
+\noindent\colorbox{yellow!12}{\parbox{0.96\linewidth}{\textbf{Evidence status (11 November 2026):} No GReST-CD network has been trained or benchmarked for this manuscript. Therefore, \emph{no measured accuracy, ablation improvement, training time, or superiority claim is available}. Numerical examples below check the definitions only. Entries marked ``Not run'' must be replaced with reproducible experimental outputs before this work can be presented as an empirical results paper.}}
+
+\subsection{Verifiable algebraic result: construction--demolition decomposition}
+
+Equation~\eqref{eq:transition} implies a nonnegative, direction-aware decomposition $p_{\rm xor}=p_{\rm new}+p_{\rm rem}$. For example, \emph{illustrative probabilities} $b_1=0.05$ and $b_2=0.95$ yield $p_{\rm new}=0.9025$, $p_{\rm rem}=0.0025$, and $p_{\rm xor}=0.9050$. If $b_1=b_2=0.95$, the same formula produces $p_{\rm new}=p_{\rm rem}=0.0475$ and $p_{\rm xor}=0.0950$. These arithmetic values are \emph{not outputs from satellite images}; they demonstrate how a well-calibrated per-date building model could avoid equating confident, unchanged building presence with new construction. The factorization assumes independence of the two Bernoulli probabilities for this auxiliary calculation, which may not hold in practice. Only empirical experiments can establish its usefulness.
+
+The optional-height formulation has a second testable logical property: when $V_H=0$, height evidence cannot alter the optical features because the height branch is multiplied by the validity gate in Equation~\eqref{eq:fusion}. This \emph{does not} automatically guarantee identical final predictions, because the decoder may learn to use the missingness indicator; equivalence must be evaluated explicitly with modality-dropout ablations. Similarly, selective prediction can reduce retained-map error only if uncertainty and error are correlated; it is \emph{not} guaranteed by a threshold alone.
+
+\subsection{Prespecified expectations and how to falsify them}
+
+\begin{table}[htbp]
+\centering\footnotesize
+\caption{Hypotheses to test, not observed improvements. Targets are illustrative preregistration criteria, not empirical findings.}
+\label{tab:hypotheses}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.20\textwidth}>{\raggedright\arraybackslash}p{0.40\textwidth}>{\raggedright\arraybackslash}p{0.25\textwidth}@{}}
+\toprule
+\tabhead{Hypothesis} & \tabhead{Success criterion (proposed)} & \tabhead{Potential falsification}\\
+\midrule
+H1: geometric robustness & Higher mean shifted-scene $F_1$ than B0, with confidence interval and per-shift breakdown & Alignment erases small true new buildings\\
+H2: nuisance robustness & At least 10\% relative false-positive-area reduction on real shadow/season subsets, with at most 1 percentage-point recall loss & Apparent gain occurs only on artificial shadows\\
+H3: cross-city transfer & Positive paired $F_1$ difference on a majority of genuinely unseen city folds & Gains are confined to familiar benchmark tiles\\
+H4: usable elevation & Improved height-only recall on a verified DSM cohort, without degradation when DSM is absent & Datum errors or fusion degrade optical-only performance\\
+H5: calibrated triage & Retained-map error declines as review rate rises, reported with full coverage curve & Uncertainty fails to identify erroneous predictions\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Empirical results table (to complete after experiments)}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Required quantitative results. ``Not run'' is intentional and must never be read as zero. Use repeated-seed mean and geographically bootstrapped 95\% confidence intervals.}
+\label{tab:resultsplaceholder}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.16\textwidth}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.13\textwidth}@{}}
+\toprule
+\tabhead{Cohort} & \tabhead{Model} & \tabhead{$F_1$/IoU} & \tabhead{FP area (m$^2$/km$^2$)} & \tabhead{Status}\\
+\midrule
+Optical, standard split & Siamese FCN & --- / --- & --- & Not run\\
+Optical, standard split & GReST-CD & --- / --- & --- & Not run\\
+Unseen cities & Siamese FCN & --- / --- & --- & Not run\\
+Unseen cities & GReST-CD & --- / --- & --- & Not run\\
+Matched optical + DSM & GReST-CD + DSM & --- / --- & --- & Not run\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation rules.} A stronger average $F_1$ would support the proposal only if the geographic holdout, seeds, confidence intervals, annotation integrity, and compute cost are disclosed. A model that gains 0.3 points but doubles inference cost may not help city-scale monitoring. A model that abstains on every difficult area may have high accepted-pixel accuracy but poor practical coverage. If results fail to meet H1--H5, report them as negative evidence and revise the design; no result should be backfilled from unrelated published articles.
+
+\section{Proposed contribution, limitations, and next implementation steps}
+
+GReST-CD offers an evaluation-ready hypothesis: \emph{physical urban structural transition should be inferred through aligned, reliability-gated evidence and reported with explicit uncertainty, with elevation used only when a valid comparable temporal pair exists}. Its distinguishing operational test is not the use of a new network family, but whether nuisance robustness, temporal directionality, and calibrated ``review required'' outputs transfer to unseen cities with a defensible compute budget. Two central limitations remain: appearance changes and genuine minor rooftop modifications may be observationally indistinguishable in optical imagery, and no method can reconstruct height-only events reliably when comparable vertical observations do not exist. The next implementation milestone is to reproduce a same-backbone optical baseline, add controlled alignment and nuisance gates one at a time, and only then attempt multimodal or directional experiments where labels permit.
+

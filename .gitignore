@@ -13,3 +13,20 @@ categorized_output
 *.pth
 data
 
+__pycache__/
+*.pyc
+.venv/
+venv/
+Dataset/
+*_output/
+change_output/
+bit_cd_output/
+*.egg-info/
+*.zip
+stac_cache
+categorized_output
+*.pth
+data
+
+output/
+urban_segmentation-main/urban_segmentation-main/docs

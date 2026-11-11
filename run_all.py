@@ -8,15 +8,15 @@ import cv2
 import numpy as np
 import os
 
-import change_core as cc
-from pipeline_unified import (
+import vlm.change_core as cc
+from vlm.pipeline_unified import (
     load_scenes_from_paths, run_irmad_spectral, PipelineParams,
     connected_regions, merge_regions, enrich_regions,
     fuse_signals, candidate_mask, run_dinov2,
     normalize01, make_overlay_with_vlm, make_side_by_side,
     score_card_image, write_report, save_debug_masks
 )
-from vlm_qa import build_montage, evidence_table, stream_answer, audit
+from vlm.vlm_qa import build_montage, evidence_table, stream_answer, audit
 
 
 def run_pipeline(args):

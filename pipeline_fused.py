@@ -35,14 +35,14 @@ try:
     from UrbanSentinel import detectors, fusion, vlm
 except ImportError:
     import detectors  # noqa: F401
-    import fusion  # noqa: F401
-    import vlm  # noqa: F401
+    import vlm.fusion as fusion  # noqa: F401
+    import vlm.vlm as vlm  # noqa: F401
 
 import rasterio  # noqa: E402  (optional for multispectral mode)
 
 from detectors import load_sam  # noqa: E402
-from fusion import DEFAULT_THRESHOLDS, DEFAULT_WEIGHTS, normalize01  # noqa: E402
-from vlm import classify_regions  # noqa: E402
+from vlm.fusion import DEFAULT_THRESHOLDS, DEFAULT_WEIGHTS, normalize01  # noqa: E402
+from vlm.vlm import classify_regions  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

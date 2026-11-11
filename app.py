@@ -10,8 +10,8 @@ from PIL import Image
 import rasterio
 from rasterio.io import MemoryFile
 
-from model import SiameseUNet, sliding_window_inference
-from visualization import overlay_change_mask
+from vlm.model import SiameseUNet, sliding_window_inference
+from vlm.visualization import overlay_change_mask
 
 app = FastAPI(
     title="UrbanSentinel API",

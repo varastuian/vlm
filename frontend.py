@@ -17,7 +17,7 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.warp import transform_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
-import change_core as cc
+import vlm.change_core as cc
 
 st.set_page_config(page_title="Sentinel Change Detection", layout="wide")
 

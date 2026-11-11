@@ -6,13 +6,13 @@ Run: python ask_vlm.py
 import cv2
 import numpy as np
 
-import change_core as cc
-from pipeline_unified import (
+import vlm.change_core as cc
+from vlm.pipeline_unified import (
     load_scenes_from_paths, run_irmad_spectral, PipelineParams,
     connected_regions, merge_regions, enrich_regions,
     fuse_signals, candidate_mask, run_dinov2
 )
-from vlm_qa import build_montage, evidence_table, stream_answer
+from vlm.vlm_qa import build_montage, evidence_table, stream_answer
 
 
 def main():

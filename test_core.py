@@ -4,8 +4,8 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import change_core as cc
-from make_synthetic_data import make, SIZE
+import vlm.change_core as cc
+from vlm.make_synthetic_data import make, SIZE
 from scipy import ndimage as ndi
 
 def old_method(b, a):

@@ -46,12 +46,12 @@ from rasterio.plot import reshape_as_raster
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import change_core as cc
+import vlm.change_core as cc
 from detectors import dino_detector, load_dino, unload_detectors
 
 # VLM audit
 try:
-    from vlm_qa import audit as vlm_audit, build_montage as vlm_build_montage, evidence_table as vlm_evidence_table, list_models as vlm_list_models
+    from vlm.vlm_qa import audit as vlm_audit, build_montage as vlm_build_montage, evidence_table as vlm_evidence_table, list_models as vlm_list_models
     VLM_AVAILABLE = True
 except ImportError:
     VLM_AVAILABLE = False
